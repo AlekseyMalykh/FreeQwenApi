@@ -808,11 +808,12 @@ export async function sendMessage(message, model = DEFAULT_MODEL, chatId = null,
     const hasTools = Array.isArray(tools) && tools.length > 0;
     let effectiveSystemMessage = systemMessage || '';
     if (hasTools) {
-        const toolPrompt = buildToolSystemPrompt(tools);
+        const projectRoot = clientWorkdir || process.cwd();
+        const toolPrompt = buildToolSystemPrompt(tools, projectRoot);
         effectiveSystemMessage = effectiveSystemMessage
             ? `${effectiveSystemMessage}\n\n${toolPrompt}`
             : toolPrompt;
-        logInfo(`Tool system prompt injected (${toolPrompt.length} chars)`);
+        logInfo(`Tool system prompt injected (${toolPrompt.length} chars), projectRoot: ${projectRoot}`);
     }
 
     // Buffer streaming when tools are present

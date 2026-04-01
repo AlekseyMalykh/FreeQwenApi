@@ -129,7 +129,7 @@ export function getToolDefinitions(toolNames = null) {
     return toolNames.filter(name => TOOL_DEFINITIONS[name]).map(name => TOOL_DEFINITIONS[name]);
 }
 
-export function buildToolSystemPrompt(toolNames = null) {
+export function buildToolSystemPrompt(toolNames = null, projectRoot = null) {
     const availableTools = getToolDefinitions(toolNames);
     if (availableTools.length === 0) return '';
 
@@ -139,6 +139,10 @@ export function buildToolSystemPrompt(toolNames = null) {
             .join('\n');
         return `### ${t.name}\n${t.description}\nParameters:\n${params}`;
     }).join('\n\n');
+
+    const projectContext = projectRoot
+        ? `\nCurrent project root: ${projectRoot}\nAll file paths should be relative to this root.\nUse the project root as the base for all workdir and path arguments.\n`
+        : '';
 
     return `You have access to tools. When you need to perform an action, use the EXACT format below.
 
@@ -153,7 +157,8 @@ RULES:
 2. Each argument on its own line starting with "ARG ".
 3. For paths, use forward slashes: C:/Projects/app/file.txt
 4. If no tool is needed, respond with normal text.
-
+5. ALWAYS use the project root as the base for all file paths and workdir.
+6. NEVER use paths outside the project root.${projectContext}
 IMPORTANT:
 You do NOT have persistent access to tools.
 Tool results are returned directly to the user.
@@ -235,6 +240,17 @@ export async function executeTool(toolName, args, clientWorkdir = null) {
     if (normalized.name === 'bash' && !ENABLE_BASH_TOOL) {
         logWarn('bash tool blocked — set ENABLE_BASH_TOOL=1 to enable');
         return { success: false, error: 'bash tool is disabled. Set ENABLE_BASH_TOOL=1 to enable.' };
+    }
+    
+    // Safety: sandbox file tools to project root
+    const projectRoot = clientWorkdir ? path.resolve(clientWorkdir) : PROJECT_ROOT;
+    const fileTools = ['read_file', 'write_file', 'edit_file'];
+    if (fileTools.includes(normalized.name) && normalized.arguments.path) {
+        const resolvedPath = path.resolve(normalized.arguments.path);
+        if (!resolvedPath.startsWith(projectRoot)) {
+            logWarn(`Path traversal blocked: ${normalized.arguments.path} (root: ${projectRoot})`);
+            return { success: false, error: `Path outside project root: ${normalized.arguments.path}` };
+        }
     }
     
     const executor = TOOL_EXECUTORS[normalized.name];

@@ -134,13 +134,31 @@ assert(emptyTools.length === 0, 'Empty array returns empty');
 // ─── 6. Path safety tests ────────────────────────────────────────────────────
 console.log('\n=== 6. Path Safety Tests ===\n');
 
-// Path traversal attempt
-const r14 = await executeTool('read_file', { path: '../../../etc/passwd' });
-assert(true, 'Path traversal does not crash');
+// Path traversal blocked by sandbox
+const r14 = await executeTool('read_file', { path: path.resolve('..', '..', 'etc', 'passwd') }, TEST_DIR);
+assert(!r14.success && r14.error?.includes('outside project'), 'Path traversal blocked by sandbox');
 
-// Absolute path handling
-const r15 = await executeTool('read_file', { path: TEST_FILE });
-assert(r15.success, 'Absolute path works');
+// Absolute path within project works
+const r15 = await executeTool('read_file', { path: TEST_FILE }, TEST_DIR);
+assert(r15.success, 'Absolute path within project works');
+
+// ─── 7. Project root injection tests ─────────────────────────────────────────
+console.log('\n=== 7. Project Root Injection Tests ===\n');
+
+const promptWithRoot = buildToolSystemPrompt([{
+    type: 'function',
+    function: { name: 'bash', description: 'test', parameters: { type: 'object', properties: {}, required: [] } }
+}], 'C:/Projects/my-app');
+
+assert(promptWithRoot.includes('C:/Projects/my-app'), 'Prompt includes project root');
+assert(promptWithRoot.includes('Current project root:'), 'Prompt has project root label');
+assert(promptWithRoot.includes('NEVER use paths outside'), 'Prompt includes sandbox warning');
+
+const promptNoRoot = buildToolSystemPrompt([{
+    type: 'function',
+    function: { name: 'bash', description: 'test', parameters: { type: 'object', properties: {}, required: [] } }
+}]);
+assert(!promptNoRoot.includes('Current project root:'), 'Prompt without root has no project label');
 
 // ─── Cleanup ─────────────────────────────────────────────────────────────────
 cleanup();
