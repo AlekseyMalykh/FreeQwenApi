@@ -28,6 +28,17 @@ let browserTokenRateLimited = false;
 
 const delay = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
+import { buildProviderPayload } from '../providers/request-adapter.js';
+import {
+    createAssistantMessage,
+    resolveToolCalls
+} from '../providers/response-adapter.js';
+import {
+    executeTool,
+    parseToolCallFromText,
+    buildToolSystemPrompt
+} from '../tools/toolExecutor.js';
+
 // ─── Page helpers ────────────────────────────────────────────────────────────
 
 async function getPage(context) {
@@ -299,6 +310,9 @@ function validateAndPrepareMessage(message) {
         return { error: 'Сообщение не может быть пустым' };
     }
     if (typeof message === 'string') return { content: message };
+    if (message && typeof message === 'object' && message.__conversation === true && Array.isArray(message.messages)) {
+        return { content: message };
+    }
     if (Array.isArray(message)) {
         const isValid = message.every(item =>
             (item.type === 'text' && typeof item.text === 'string') ||
@@ -338,98 +352,186 @@ async function resolveAuthToken(browserContext) {
     return authToken ? { id: 'browser', token: authToken } : null;
 }
 
-function buildPayloadV2(messageContent, model, chatId, parentId, files, systemMessage, tools, toolChoice, chatType = 't2t', size = null) {
-    const userMessageId = crypto.randomUUID();
-    const assistantChildId = crypto.randomUUID();
 
-    const isVideo = chatType === 't2v';
 
-    const featureConfig = {
-        thinking_enabled: isVideo,
-        output_schema: 'phase'
-    };
-    if (isVideo) {
-        featureConfig.research_mode = 'normal';
-        featureConfig.auto_thinking = true;
-        featureConfig.thinking_format = 'summary';
-        featureConfig.auto_search = true;
-    }
 
-    const newMessage = {
-        fid: userMessageId,
-        parentId, parent_id: parentId,
-        role: 'user',
-        content: messageContent,
-        chat_type: chatType, sub_chat_type: chatType,
-        timestamp: Math.floor(Date.now() / 1000),
-        user_action: 'chat',
-        models: [model],
-        files: files || [],
-        childrenIds: [assistantChildId],
-        extra: { meta: { subChatType: chatType } },
-        feature_config: featureConfig
-    };
+function parseNonSseCompletionBody(body, payload = null) {
+    const isErrorCode = (code) => {
+        if (code === null || code === undefined || code === '') return false;
 
-    const payload = {
-        stream: !isVideo,
-        incremental_output: true,
-        chat_id: chatId,
-        chat_mode: 'normal',
-        messages: [newMessage],
-        model,
-        parent_id: parentId,
-        timestamp: Math.floor(Date.now() / 1000)
+        if (typeof code === 'number') {
+            return code >= 400;
+        }
+
+        if (typeof code === 'string') {
+            const normalized = code.trim().toLowerCase();
+
+            if (!normalized) return false;
+
+            if (normalized === 'ratelimited') return true;
+            if (normalized === 'error') return true;
+            if (normalized === 'failed') return true;
+            if (normalized === 'forbidden') return true;
+            if (normalized === 'unauthorized') return true;
+            if (normalized === 'invalid_request') return true;
+
+            if (/^\d+$/.test(normalized)) {
+                return Number(normalized) >= 400;
+            }
+
+            return false;
+        }
+
+        return false;
     };
 
-    if (size) payload.size = size;
-
-    if (systemMessage) {
-        payload.system_message = systemMessage;
-        logDebug(`System message: ${systemMessage.substring(0, 100)}${systemMessage.length > 100 ? '...' : ''}`);
-    }
-    if (tools && Array.isArray(tools) && tools.length > 0) {
-        payload.tools = tools;
-        payload.tool_choice = toolChoice || 'auto';
-    }
-
-    return payload;
-}
-
-function parseNonSseCompletionBody(body) {
     try {
         const parsed = JSON.parse(body);
+
         const topLevelCode = parsed?.code;
         const nestedCode = parsed?.data?.code;
-        const hasStructuredError =
+
+        const explicitError =
             parsed?.success === false ||
             Boolean(parsed?.error) ||
             Boolean(parsed?.data?.error) ||
-            Boolean(topLevelCode) ||
-            Boolean(nestedCode);
+            isErrorCode(topLevelCode) ||
+            isErrorCode(nestedCode);
 
-        if (hasStructuredError) {
-            const isRateLimited = topLevelCode === 'RateLimited' || nestedCode === 'RateLimited';
+        if (explicitError) {
+            const isRateLimited =
+                String(topLevelCode).toLowerCase() === 'ratelimited' ||
+                String(nestedCode).toLowerCase() === 'ratelimited' ||
+                topLevelCode === 429 ||
+                nestedCode === 429 ||
+                String(topLevelCode) === '429' ||
+                String(nestedCode) === '429';
+
             return {
                 success: false,
                 status: isRateLimited ? 429 : 500,
+                error:
+                    parsed?.error ||
+                    parsed?.data?.error ||
+                    parsed?.message ||
+                    parsed?.data?.message ||
+                    `Structured API error (code: ${topLevelCode ?? nestedCode ?? 'unknown'})`,
                 errorBody: body
             };
         }
 
-        if (parsed.choices || parsed.id || (parsed.success === true && parsed.data)) {
-            return { success: true, isTask: false, data: parsed };
-        }
-    } catch {
-        // Ignore parse errors here and return a generic failure below.
-    }
+        const candidate =
+            (parsed?.choices || parsed?.id || parsed?.response_id)
+                ? parsed
+                : (parsed?.success === true && parsed?.data ? parsed.data : parsed);
 
-    return { success: false, error: 'Unexpected non-SSE 200 response', errorBody: body };
+        if (candidate && typeof candidate === 'object' && (candidate?.choices || candidate?.id || candidate?.response_id)) {
+            const choice = candidate?.choices?.[0] || {};
+            const originalMessage = choice?.message || {};
+
+            const messageContent =
+                typeof originalMessage?.content === 'string'
+                    ? originalMessage.content
+                    : '';
+
+            let finalToolCalls = [];
+
+            try {
+                finalToolCalls = resolveToolCalls(
+                    messageContent,
+                    Array.isArray(originalMessage.tool_calls) ? originalMessage.tool_calls : [],
+                    payload
+                );
+            } catch (e) {
+                return {
+                    success: false,
+                    error: e?.message || String(e),
+                    details: e?.stack || null,
+                    stage: 'parseNonSseCompletionBody:tool_processing',
+                    errorBody: body
+                };
+            }
+
+            let assistantMessage;
+            try {
+                assistantMessage = createAssistantMessage(messageContent, finalToolCalls);
+            } catch (e) {
+                return {
+                    success: false,
+                    error: e?.message || String(e),
+                    details: e?.stack || null,
+                    stage: 'parseNonSseCompletionBody:createAssistantMessage',
+                    errorBody: body
+                };
+            }
+
+            if (Array.isArray(candidate.choices) && candidate.choices[0]) {
+                candidate.choices[0].message = assistantMessage;
+                candidate.choices[0].finish_reason =
+                    finalToolCalls.length > 0
+                        ? 'tool_calls'
+                        : (choice.finish_reason || 'stop');
+            } else {
+                candidate.choices = [
+                    {
+                        index: 0,
+                        message: assistantMessage,
+                        finish_reason: finalToolCalls.length > 0 ? 'tool_calls' : 'stop'
+                    }
+                ];
+            }
+
+            if (!candidate.object) {
+                candidate.object = 'chat.completion';
+            }
+
+            if (!candidate.created) {
+                candidate.created = Math.floor(Date.now() / 1000);
+            }
+
+            if (!candidate.model && payload?.model) {
+                candidate.model = payload.model;
+            }
+
+            if (!candidate.usage) {
+                candidate.usage = {
+                    prompt_tokens: 0,
+                    completion_tokens: 0,
+                    total_tokens: 0
+                };
+            }
+
+            return {
+                success: true,
+                isTask: false,
+                data: candidate
+            };
+        }
+
+        return {
+            success: false,
+            error: 'Unexpected non-SSE 200 response structure',
+            errorBody: body
+        };
+    } catch (e) {
+        return {
+            success: false,
+            error: e?.message || 'Failed to parse non-SSE response as JSON',
+            details: e?.stack || null,
+            errorBody: body
+        };
+    }
 }
 
 async function executeApiRequestWithNodeStreaming(apiUrl, payload, token, onChunk) {
     try {
-        if (!token) return { success: false, error: 'Токен авторизации не найден' };
-        if (typeof fetch !== 'function') return { success: false, error: 'Fetch API is unavailable' };
+        if (!token) {
+            return { success: false, error: 'Токен авторизации не найден' };
+        }
+
+        if (typeof fetch !== 'function') {
+            return { success: false, error: 'Fetch API is unavailable' };
+        }
 
         const response = await fetch(apiUrl, {
             method: 'POST',
@@ -443,27 +545,85 @@ async function executeApiRequestWithNodeStreaming(apiUrl, payload, token, onChun
 
         if (!response.ok) {
             const errorBody = await response.text();
-            return { success: false, status: response.status, statusText: response.statusText, errorBody };
+            return {
+                success: false,
+                status: response.status,
+                statusText: response.statusText,
+                errorBody
+            };
         }
 
         if (payload.stream === false) {
-            const jsonResponse = await response.json();
-            if (jsonResponse.code === 'RateLimited' || jsonResponse.error) {
-                return { success: false, status: 429, errorBody: JSON.stringify(jsonResponse) };
+            const body = await response.text();
+            const parsedResponse = parseNonSseCompletionBody(body, payload);
+
+            if (parsedResponse && typeof parsedResponse === 'object') {
+                if (parsedResponse.success) {
+                    return parsedResponse;
+                }
+            } else {
+                return {
+                    success: false,
+                    error: 'parseNonSseCompletionBody returned invalid result',
+                    details: String(parsedResponse)
+                };
             }
-            return { success: true, isTask: true, data: jsonResponse };
+
+            try {
+                const jsonResponse = JSON.parse(body);
+
+                if (jsonResponse.code === 'RateLimited' || jsonResponse.error) {
+                    return {
+                        success: false,
+                        status: 429,
+                        errorBody: JSON.stringify(jsonResponse)
+                    };
+                }
+
+                return {
+                    success: true,
+                    isTask: true,
+                    data: jsonResponse
+                };
+            } catch (e) {
+                return {
+                    success: false,
+                    error: e?.message || 'Failed to parse non-stream response',
+                    details: body
+                };
+            }
         }
 
         const contentType = response.headers.get('content-type') || '';
         if (!contentType.includes('text/event-stream')) {
             const body = await response.text();
-            return parseNonSseCompletionBody(body);
+            const parsed = parseNonSseCompletionBody(body, payload);
+
+            if (parsed && typeof parsed === 'object') {
+                return parsed;
+            }
+
+            return {
+                success: false,
+                error: 'parseNonSseCompletionBody returned invalid result',
+                details: String(parsed)
+            };
         }
 
         const reader = response.body?.getReader?.();
         if (!reader) {
             const body = await response.text();
-            return parseNonSseCompletionBody(body);
+            const parsed = parseNonSseCompletionBody(body, payload);
+
+            if (parsed && typeof parsed === 'object') {
+                return parsed;
+            }
+
+            return {
+                success: false,
+                error: 'parseNonSseCompletionBody returned invalid result',
+                details: String(parsed)
+            };
         }
 
         const decoder = new TextDecoder();
@@ -474,6 +634,10 @@ async function executeApiRequestWithNodeStreaming(apiUrl, payload, token, onChun
         let finished = false;
         let streamError = null;
         let hasStreamedChunks = false;
+        const collectedToolCalls = [];
+
+        const supportsNativeTools = Boolean(payload?._caps?.supportsNativeTools);
+        const useLocalToolInference = Boolean(payload?._caps?.useLocalToolInference);
 
         while (!finished) {
             const { done, value } = await reader.read();
@@ -489,6 +653,7 @@ async function executeApiRequestWithNodeStreaming(apiUrl, payload, token, onChun
 
                 const jsonStr = line.substring(5).trim();
                 if (!jsonStr) continue;
+
                 if (jsonStr === '[DONE]') {
                     finished = true;
                     break;
@@ -498,41 +663,143 @@ async function executeApiRequestWithNodeStreaming(apiUrl, payload, token, onChun
                     const chunk = JSON.parse(jsonStr);
 
                     if (chunk.code === 'RateLimited' || (chunk.code && chunk.detail)) {
-                        streamError = { status: 429, errorBody: JSON.stringify(chunk) };
-                        finished = true;
-                        break;
-                    }
-                    if (chunk.error && !chunk.choices) {
-                        streamError = { status: 500, errorBody: JSON.stringify(chunk) };
+                        streamError = {
+                            status: 429,
+                            errorBody: JSON.stringify(chunk)
+                        };
                         finished = true;
                         break;
                     }
 
-                    if (chunk['response.created']) responseId = chunk['response.created'].response_id;
-                    if (chunk.response_id) responseId = chunk.response_id;
+                    if (chunk.error && !chunk.choices) {
+                        streamError = {
+                            status: 500,
+                            errorBody: JSON.stringify(chunk)
+                        };
+                        finished = true;
+                        break;
+                    }
+
+                    if (chunk['response.created']) {
+                        responseId = chunk['response.created'].response_id;
+                    }
+
+                    if (chunk.response_id) {
+                        responseId = chunk.response_id;
+                    }
+
+                    if (chunk.usage) {
+                        usage = chunk.usage;
+                    }
 
                     if (chunk.choices && chunk.choices[0]) {
-                        const delta = chunk.choices[0].delta;
-                        if (delta && delta.content) {
+                        const choice = chunk.choices[0];
+                        const delta = choice.delta || {};
+
+                        if (typeof delta.content === 'string' && delta.content.length > 0) {
                             fullContent += delta.content;
-                            if (typeof onChunk === 'function') {
+
+                            const shouldStreamTextImmediately =
+                                supportsNativeTools || !useLocalToolInference;
+
+                            if (shouldStreamTextImmediately && typeof onChunk === 'function') {
                                 onChunk(delta.content);
                                 hasStreamedChunks = true;
                             }
                         }
-                        if (delta && delta.status === 'finished') finished = true;
-                        if (chunk.choices[0].finish_reason) finished = true;
-                    }
 
-                    if (chunk.usage) usage = chunk.usage;
-                } catch {
-                    // Ignore broken chunks, keep reading stream.
+                        if (Array.isArray(delta.tool_calls)) {
+                            for (const toolCallDelta of delta.tool_calls) {
+                                const index = toolCallDelta.index ?? 0;
+
+                                if (!collectedToolCalls[index]) {
+                                    collectedToolCalls[index] = {
+                                        id: toolCallDelta.id || `call_${Date.now()}_${index}`,
+                                        type: toolCallDelta.type || 'function',
+                                        function: {
+                                            name: toolCallDelta.function?.name || '',
+                                            arguments: toolCallDelta.function?.arguments || ''
+                                        }
+                                    };
+                                } else {
+                                    if (toolCallDelta.id) {
+                                        collectedToolCalls[index].id = toolCallDelta.id;
+                                    }
+
+                                    if (toolCallDelta.type) {
+                                        collectedToolCalls[index].type = toolCallDelta.type;
+                                    }
+
+                                    if (toolCallDelta.function?.name) {
+                                        collectedToolCalls[index].function.name += toolCallDelta.function.name;
+                                    }
+
+                                    if (toolCallDelta.function?.arguments) {
+                                        collectedToolCalls[index].function.arguments += toolCallDelta.function.arguments;
+                                    }
+                                }
+                            }
+                        }
+
+                        const finishReason = choice.finish_reason;
+                        if (
+                            finishReason === 'stop' ||
+                            finishReason === 'tool_calls' ||
+                            finishReason === 'length'
+                        ) {
+                            finished = true;
+                        }
+
+                        if (delta.status === 'finished') {
+                            finished = true;
+                        }
+                    }
+                } catch (e) {
+                    logDebug(`Broken SSE chunk: ${jsonStr}`);
+                    logDebug(`Chunk parse error: ${e?.message || String(e)}`);
                 }
             }
         }
 
         if (streamError) {
-            return { success: false, ...streamError, hasStreamedChunks };
+            return {
+                success: false,
+                ...streamError,
+                hasStreamedChunks
+            };
+        }
+
+        let finalToolCalls = [];
+        let assistantMessage;
+
+        try {
+            finalToolCalls = resolveToolCalls(
+                fullContent,
+                collectedToolCalls,
+                payload
+            );
+
+            assistantMessage = createAssistantMessage(
+                fullContent,
+                finalToolCalls
+            );
+        } catch (e) {
+            return {
+                success: false,
+                error: e?.message || String(e),
+                details: e?.stack || null,
+                stage: 'finalize_response'
+            };
+        }
+
+        if (
+            finalToolCalls.length === 0 &&
+            fullContent &&
+            typeof onChunk === 'function' &&
+            !hasStreamedChunks
+        ) {
+            onChunk(fullContent);
+            hasStreamedChunks = true;
         }
 
         return {
@@ -544,13 +811,27 @@ async function executeApiRequestWithNodeStreaming(apiUrl, payload, token, onChun
                 object: 'chat.completion',
                 created: Math.floor(Date.now() / 1000),
                 model: payload.model,
-                choices: [{ index: 0, message: { role: 'assistant', content: fullContent }, finish_reason: 'stop' }],
-                usage: usage || { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+                choices: [
+                    {
+                        index: 0,
+                        message: assistantMessage,
+                        finish_reason: finalToolCalls.length > 0 ? 'tool_calls' : 'stop'
+                    }
+                ],
+                usage: usage || {
+                    prompt_tokens: 0,
+                    completion_tokens: 0,
+                    total_tokens: 0
+                },
                 response_id: responseId
             }
         };
     } catch (error) {
-        return { success: false, error: error.toString() };
+        return {
+            success: false,
+            error: error?.message || String(error),
+            details: error?.stack || null
+        };
     }
 }
 
@@ -699,66 +980,404 @@ async function executeApiRequest(page, apiUrl, payload, token, onChunk = null) {
             const errorBody = await response.text();
             return { success: false, status: response.status, statusText: response.statusText, errorBody };
         } catch (error) {
-            return { success: false, error: error.toString() };
+            return {
+                success: false,
+                error: error?.message || String(error),
+                details: error?.stack || null
+            };
         }
     }, requestBody);
 }
 
 async function handleApiError(response, tokenObj, message, model, chatId, parentId, files, retryCount, chatType, size, waitForCompletion, onChunk = null) {
-    logRaw(JSON.stringify(response));
-    logError(`Ошибка при получении ответа: ${response.error || response.statusText}`);
-    if (response.errorBody) logDebug(`Тело ответа с ошибкой: ${response.errorBody}`);
-
-    if (response.html && response.html.includes('Verification')) {
-        setAuthenticationStatus(false);
-        logInfo('Обнаружена необходимость верификации, перезапуск браузера в видимом режиме...');
-        await pagePool.clear();
-        authToken = null;
-        await shutdownBrowser();
-        await initBrowser(true);
-        return { error: 'Требуется верификация. Браузер запущен в видимом режиме.', verification: true, chatId };
+    if (!response || typeof response !== 'object') {
+        logError(`Ошибка при получении ответа: response is invalid -> ${String(response)}`);
+        return {
+            error: `Invalid response from API: ${String(response)}`,
+            details: 'handleApiError получил пустой или некорректный response',
+            chatId
+        };
     }
 
-    if (response.status === 401 || (response.errorBody && (response.errorBody.includes('Unauthorized') || response.errorBody.includes('Token has expired')))) {
-        logWarn(`Токен ${tokenObj?.id} недействителен (401). Удаляем и пробуем другой.`);
-        authToken = null;
-        browserTokenRateLimited = false;
-        if (tokenObj?.id && tokenObj.id !== 'browser') {
-            const { markInvalid } = await import('./tokenManager.js');
-            markInvalid(tokenObj.id);
-        }
-        const { hasValidTokens } = await import('./tokenManager.js');
-        if (hasValidTokens() && retryCount < MAX_RETRY_COUNT) {
-            return sendMessage(message, model, chatId, parentId, files, null, null, null, chatType, size, waitForCompletion, retryCount + 1, onChunk);
-        }
-        logError('Не осталось валидных токенов или исчерпаны попытки.');
-        return { error: 'Все токены недействительны (401). Требуется повторная авторизация.', chatId };
+    try {
+        logRaw(JSON.stringify(response, null, 2));
+    } catch (e) {
+        logError(`Не удалось сериализовать response в handleApiError: ${e?.message || String(e)}`);
     }
 
-    if (response.status === 429 || (response.errorBody && response.errorBody.includes('RateLimited'))) {
-        let hours = 24;
+    const errorMessage =
+        response.error ||
+        response.statusText ||
+        response.errorBody ||
+        response.message ||
+        'Unknown API error';
+
+    logError(`Ошибка при получении ответа: ${errorMessage}`);
+
+    if (response.errorBody) {
+        logDebug(`Тело ответа с ошибкой: ${response.errorBody}`);
+    }
+
+    return {
+        error: errorMessage,
+        details: response.errorBody || response.details || 'Нет дополнительных деталей',
+        chatId
+    };
+}
+export async function sendMessageWithTools(message, model = DEFAULT_MODEL, chatId = null, parentId = null, files = null, tools = null, toolChoice = null, systemMessage = null, chatType = 't2t', size = null, waitForCompletion = true, retryCount = 0, onChunk = null, maxToolRounds = 5) {
+    if (!availableModels) availableModels = getAvailableModelsFromFile();
+
+    if (!chatId) {
+        const newChatResult = await createChatV2(model);
+        if (newChatResult.error) return { error: 'Не удалось создать чат: ' + newChatResult.error };
+        chatId = newChatResult.chatId;
+        logInfo(`Создан новый чат v2 с ID: ${chatId}`);
+    }
+
+    const validated = validateAndPrepareMessage(message);
+    if (validated.error) {
+        logError(validated.error);
+        return { error: validated.error, chatId };
+    }
+    let messageContent = validated.content;
+
+    if (!model || model.trim() === '') {
+        model = DEFAULT_MODEL;
+    } else if (!isValidModel(model)) {
+        logWarn(`Модель "${model}" не найдена в списке доступных. Используется модель по умолчанию.`);
+        model = DEFAULT_MODEL;
+    }
+    logInfo(`Используемая модель: "${model}"`);
+    if (chatType !== 't2t') {
+        const typeLabels = { t2i: 'изображение', t2v: 'видео' };
+        logInfo(`Тип генерации: ${chatType} (${typeLabels[chatType] || chatType})${size ? `, размер: ${size}` : ''}`);
+    }
+
+    const browserContext = getBrowserContext();
+    if (!browserContext) return { error: 'Браузер не инициализирован', chatId };
+
+    const tokenObj = await resolveAuthToken(browserContext);
+    if (!tokenObj) return { error: 'Ошибка авторизации: не удалось получить токен', chatId };
+
+    // Build enhanced system message with tool descriptions
+    let effectiveSystemMessage = systemMessage || '';
+    const toolPrompt = buildToolSystemPrompt(tools);
+    if (toolPrompt) {
+        effectiveSystemMessage = effectiveSystemMessage
+            ? `${effectiveSystemMessage}\n\n${toolPrompt}`
+            : toolPrompt;
+        logInfo(`Tool system prompt injected (${toolPrompt.length} chars)`);
+    }
+
+    // When tools are present, buffer streaming output to avoid sending raw JSON to client.
+    // We need the full response first to detect tool calls, then execute tools, then send final answer.
+    const hasTools = Array.isArray(tools) && tools.length > 0;
+    const bufferedChunks = [];
+    let streamingCallback = onChunk;
+    
+    if (hasTools && typeof onChunk === 'function') {
+        streamingCallback = (chunk) => {
+            bufferedChunks.push(chunk);
+        };
+    }
+
+    let currentParentId = parentId;
+    let accumulatedContent = '';
+    let allToolCalls = [];
+
+    for (let round = 0; round <= maxToolRounds; round++) {
+        logInfo(`=== Tool execution round ${round}/${maxToolRounds} ===`);
+
+        let page = null;
         try {
-            const rateInfo = JSON.parse(response.errorBody);
-            hours = Number(rateInfo.num) || 24;
-        } catch { /* errorBody might not be valid JSON */ }
+            page = await pagePool.getPage(browserContext);
 
-        if (tokenObj?.id === 'browser') {
-            browserTokenRateLimited = true;
-            logWarn(`Browser-токен достиг лимита. Помечаем на ${hours}ч.`);
-        } else if (tokenObj?.id) {
-            markRateLimited(tokenObj.id, hours);
-            logWarn(`Токен ${tokenObj.id} достиг лимита. Помечаем на ${hours}ч и пробуем другой токен...`);
-        }
+            const verificationNeeded = await checkVerification(page);
+            if (verificationNeeded) {
+                await page.reload({ waitUntil: 'domcontentloaded', timeout: PAGE_TIMEOUT });
+            }
 
-        authToken = null;
-        const { hasValidTokens } = await import('./tokenManager.js');
-        if (hasValidTokens() && retryCount < MAX_RETRY_COUNT) {
-            return sendMessage(message, model, chatId, parentId, files, null, null, null, chatType, size, waitForCompletion, retryCount + 1, onChunk);
+            if (!authToken) {
+                logWarn('Токен отсутствует перед отправкой запроса');
+                authToken = await page.evaluate(() => localStorage.getItem('token'));
+                if (!authToken) return { error: 'Токен авторизации не найден. Требуется перезапуск в ручном режиме.', chatId };
+                saveAuthToken(authToken);
+            }
+
+            logInfo('Отправка запроса к API v2...');
+
+            const payload = buildProviderPayload({
+                messageContent,
+                model,
+                chatId,
+                parentId: currentParentId,
+                files,
+                systemMessage: effectiveSystemMessage,
+                tools,
+                toolChoice,
+                chatType,
+                size,
+                provider: 'freeqwen'
+            });
+            logDebug('=== PAYLOAD V2 ===\n' + JSON.stringify(payload, null, 2));
+            logDebug(`Отправка сообщения в чат ${chatId} с parent_id: ${currentParentId || 'null'}`);
+
+            const apiUrl = `${CHAT_API_URL}?chat_id=${chatId}`;
+            const response = await executeApiRequest(page, apiUrl, payload, authToken, streamingCallback);
+
+            logDebug(`RAW executeApiRequest result type: ${typeof response}`);
+            try {
+                logRaw(JSON.stringify(response, null, 2));
+            } catch (e) {
+                logError(`Не удалось сериализовать response: ${e?.message || String(e)}`);
+            }
+
+            if (!response || typeof response !== 'object') {
+                logError(`executeApiRequest вернул некорректный response: ${String(response)}`);
+                return {
+                    error: `executeApiRequest returned invalid response: ${String(response)}`,
+                    chatId
+                };
+            }
+
+            if (response.success && response.isTask) {
+                logInfo('Обнаружен ответ с задачей (видеогенерация)');
+                logRaw(JSON.stringify(response.data));
+
+                const taskId = extractTaskId(response.data);
+                if (!taskId) {
+                    logError('Task ID не найден в ответе');
+                    pagePool.releasePage(page);
+                    page = null;
+                    return { error: 'Task ID not found in response', chatId, rawResponse: response.data };
+                }
+
+                logInfo(`Task ID: ${taskId}`);
+
+                if (!waitForCompletion) {
+                    logInfo('Возвращаем task_id для клиентского polling');
+                    pagePool.releasePage(page);
+                    page = null;
+                    return {
+                        id: taskId,
+                        object: 'chat.completion.task',
+                        created: Math.floor(Date.now() / 1000),
+                        model,
+                        task_id: taskId,
+                        chatId,
+                        parentId: response.data.data?.parent_id || taskId,
+                        status: 'processing',
+                        message: 'Video generation task created. Poll GET /api/tasks/status/:taskId for progress.'
+                    };
+                }
+
+                logInfo('Начинаем polling для получения видео...');
+                const taskResult = await pollTaskStatus(taskId, page, authToken);
+
+                pagePool.releasePage(page);
+                page = null;
+
+                if (taskResult.success && taskResult.status === 'completed') {
+                    logInfo('Видео успешно сгенерировано');
+                    const videoUrl = extractVideoUrl(taskResult.data);
+                    return {
+                        id: taskId,
+                        object: 'chat.completion',
+                        created: Math.floor(Date.now() / 1000),
+                        model,
+                        choices: [{
+                            index: 0,
+                            message: { role: 'assistant', content: videoUrl || JSON.stringify(taskResult.data) },
+                            finish_reason: 'stop'
+                        }],
+                        usage: taskResult.data.usage || { prompt_tokens: 0, output_tokens: 0, total_tokens: 0 },
+                        response_id: taskId,
+                        chatId,
+                        parentId: taskId,
+                        task_id: taskId,
+                        video_url: videoUrl
+                    };
+                }
+
+                logError(`Не удалось получить видео: ${taskResult.error}`);
+                return { error: taskResult.error || 'Video generation failed', status: taskResult.status, chatId, task_id: taskId };
+            }
+
+            pagePool.releasePage(page);
+            page = null;
+
+            if (response.success) {
+                logRaw(JSON.stringify(response.data));
+                logInfo('Ответ получен успешно');
+                response.data.chatId = chatId;
+                response.data.parentId = response.data.response_id;
+                response.data.id = response.data.id || 'chatcmpl-' + Date.now();
+
+                const message = response.data.choices?.[0]?.message;
+                const hasToolCalls = Array.isArray(message?.tool_calls) && message.tool_calls.length > 0;
+
+                if (
+                    typeof onChunk === 'function' &&
+                    message?.content &&
+                    !response.hasStreamedChunks &&
+                    !hasToolCalls
+                ) {
+                    onChunk(message.content);
+                }
+
+                // Check if model wants to use tools
+                const content = message?.content || '';
+                let toolCalls = null;
+
+                if (hasToolCalls) {
+                    toolCalls = message.tool_calls;
+                } else if (tools && tools.length > 0 && content) {
+                    toolCalls = parseToolCallFromText(content);
+                    
+                    // Fallback: try direct JSON parse if content looks like tool call
+                    if (!toolCalls && content.trim().startsWith('{')) {
+                        try {
+                            const parsed = JSON.parse(content.trim());
+                            if (parsed.tool_calls && Array.isArray(parsed.tool_calls)) {
+                                toolCalls = parsed.tool_calls.map(tc => ({
+                                    name: tc.name,
+                                    arguments: typeof tc.arguments === 'string' ? JSON.parse(tc.arguments) : (tc.arguments || {})
+                                }));
+                            }
+                        } catch (e) {
+                            // Not valid JSON, ignore
+                        }
+                    }
+                }
+
+                // Also check buffered chunks for tool calls (streaming mode)
+                if (!toolCalls && tools && tools.length > 0 && bufferedChunks.length > 0) {
+                    const fullBuffered = bufferedChunks.join('');
+                    if (fullBuffered.trim().startsWith('{')) {
+                        try {
+                            const parsed = JSON.parse(fullBuffered.trim());
+                            if (parsed.tool_calls && Array.isArray(parsed.tool_calls)) {
+                                toolCalls = parsed.tool_calls.map(tc => ({
+                                    name: tc.name,
+                                    arguments: typeof tc.arguments === 'string' ? JSON.parse(tc.arguments) : (tc.arguments || {})
+                                }));
+                                // Update content to match buffered
+                                message.content = fullBuffered;
+                            }
+                        } catch (e) {
+                            // Not valid JSON, ignore
+                        }
+                    }
+                }
+
+                if (!toolCalls || toolCalls.length === 0) {
+                    // No tool calls needed — final response
+                    // Flush buffered chunks to client if we were buffering
+                    if (hasTools && bufferedChunks.length > 0 && typeof onChunk === 'function') {
+                        for (const chunk of bufferedChunks) {
+                            onChunk(chunk);
+                        }
+                    }
+                    if (round > 0 && accumulatedContent) {
+                        response.data.choices[0].message.content = accumulatedContent + '\n\n' + (content || '');
+                    }
+                    if (allToolCalls.length > 0) {
+                        response.data.tool_calls = allToolCalls;
+                    }
+                    return response.data;
+                }
+
+                // We have tool calls — execute them
+                // Discard buffered chunks (they contain raw JSON, not useful to client)
+                bufferedChunks.length = 0;
+                logInfo(`Model requested ${toolCalls.length} tool call(s), round ${round}`);
+                logInfo(`Tool calls: ${JSON.stringify(toolCalls)}`);
+                allToolCalls.push(...toolCalls);
+
+                const toolResults = [];
+                for (const tc of toolCalls) {
+                    const toolName = tc.name || tc.function?.name;
+                    const toolArgs = tc.arguments || (tc.function?.arguments ? JSON.parse(tc.function.arguments) : {});
+
+                    logInfo(`Executing tool: ${toolName} with args: ${JSON.stringify(toolArgs)}`);
+                    const result = await executeTool(toolName, toolArgs);
+
+                    if (result.success) {
+                        toolResults.push({
+                            name: toolName,
+                            output: result.output || '(no output)'
+                        });
+                        logInfo(`Tool ${toolName} executed successfully, output length: ${(result.output || '').length}`);
+                    } else {
+                        toolResults.push({
+                            name: toolName,
+                            output: `Error: ${result.error || 'Unknown error'}`
+                        });
+                        logError(`Tool ${toolName} failed: ${result.error}`);
+                    }
+                }
+
+                // Build tool results text
+                const toolResultsText = toolResults
+                    .map(tr => `## Result of ${tr.name}:\n${tr.output}`)
+                    .join('\n\n---\n\n');
+
+                logInfo(`Tool results ready. Returning directly.`);
+                logDebug(`Tool results text: ${toolResultsText.substring(0, 500)}`);
+
+                // Qwen API v2 does NOT support multi-turn with tool results.
+                // Return tool output directly. Clients like opencode will format it.
+                // Discard buffered chunks since we're returning tool results instead.
+                bufferedChunks.length = 0;
+
+                return {
+                    id: response.data.id || 'chatcmpl-' + Date.now(),
+                    object: 'chat.completion',
+                    created: Math.floor(Date.now() / 1000),
+                    model,
+                    choices: [{
+                        index: 0,
+                        message: {
+                            role: 'assistant',
+                            content: toolResultsText
+                        },
+                        finish_reason: 'tool_calls'
+                    }],
+                    usage: response.data.usage || { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+                    chatId,
+                    parentId: response.data.response_id || response.data.parentId,
+                    tool_calls: allToolCalls
+                };
+            }
+
+            return handleApiError(response, tokenObj, message, model, chatId, currentParentId, files, retryCount, chatType, size, waitForCompletion, onChunk);
+        } catch (error) {
+            logError('Ошибка при отправке сообщения', error);
+            return { error: error.toString(), chatId };
+        } finally {
+            if (page) {
+                pagePool.releasePage(page);
+            }
         }
-        return { error: `Все токены заблокированы по лимиту (${hours}ч)`, chatId };
     }
 
-    return { error: response.error || response.statusText, details: response.errorBody || 'Нет дополнительных деталей', chatId };
+    // Max rounds reached
+    logWarn(`Max tool rounds (${maxToolRounds}) reached`);
+    return {
+        id: 'chatcmpl-' + Date.now(),
+        object: 'chat.completion',
+        created: Math.floor(Date.now() / 1000),
+        model,
+        choices: [{
+            index: 0,
+            message: { role: 'assistant', content: accumulatedContent || 'Tool execution limit reached.' },
+            finish_reason: 'tool_calls'
+        }],
+        usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+        chatId,
+        parentId: currentParentId,
+        tool_calls: allToolCalls
+    };
 }
 
 // ─── Main public API ─────────────────────────────────────────────────────────
@@ -816,12 +1435,39 @@ export async function sendMessage(message, model = DEFAULT_MODEL, chatId = null,
 
         logInfo('Отправка запроса к API v2...');
 
-        const payload = buildPayloadV2(messageContent, model, chatId, parentId, files, systemMessage, tools, toolChoice, chatType, size);
+        const payload = buildProviderPayload({
+            messageContent,
+            model,
+            chatId,
+            parentId,
+            files,
+            systemMessage,
+            tools,
+            toolChoice,
+            chatType,
+            size,
+            provider: 'freeqwen'
+        });
         logDebug('=== PAYLOAD V2 ===\n' + JSON.stringify(payload, null, 2));
         logDebug(`Отправка сообщения в чат ${chatId} с parent_id: ${parentId || 'null'}`);
 
-        const apiUrl = `${CHAT_API_URL}?chat_id=${chatId}`;
-        const response = await executeApiRequest(page, apiUrl, payload, authToken, onChunk);
+            const apiUrl = `${CHAT_API_URL}?chat_id=${chatId}`;
+            const response = await executeApiRequest(page, apiUrl, payload, authToken, streamingCallback);
+
+        logDebug(`RAW executeApiRequest result type: ${typeof response}`);
+        try {
+            logRaw(JSON.stringify(response, null, 2));
+        } catch (e) {
+            logError(`Не удалось сериализовать response: ${e?.message || String(e)}`);
+        }
+
+        if (!response || typeof response !== 'object') {
+            logError(`executeApiRequest вернул некорректный response: ${String(response)}`);
+            return {
+                error: `executeApiRequest returned invalid response: ${String(response)}`,
+                chatId
+            };
+        }
 
         if (response.success && response.isTask) {
             logInfo('Обнаружен ответ с задачей (видеогенерация)');
@@ -896,9 +1542,17 @@ export async function sendMessage(message, model = DEFAULT_MODEL, chatId = null,
             response.data.parentId = response.data.response_id;
             response.data.id = response.data.id || 'chatcmpl-' + Date.now();
             
-            // Fallback: если поток чанков не был отдан, отправляем контент единым куском.
-            if (typeof onChunk === 'function' && response.data.choices?.[0]?.message?.content && !response.hasStreamedChunks) {
-                onChunk(response.data.choices[0].message.content);
+            const message = response.data.choices?.[0]?.message;
+            const hasToolCalls = Array.isArray(message?.tool_calls) && message.tool_calls.length > 0;
+
+            // 🚨 НЕ отправляем content если есть tool_calls
+            if (
+                typeof onChunk === 'function' &&
+                message?.content &&
+                !response.hasStreamedChunks &&
+                !hasToolCalls
+            ) {
+                onChunk(message.content);
             }
             
             return response.data;
@@ -974,7 +1628,11 @@ export async function createChatV2(model = DEFAULT_MODEL, title = 'Новый ч
                 if (response.ok) return { success: true, data: await response.json() };
                 return { success: false, status: response.status, errorBody: await response.text() };
             } catch (error) {
-                return { success: false, error: error.toString() };
+                return {
+                    success: false,
+                    error: error?.message || String(error),
+                    details: error?.stack || null
+                };
             }
         }, requestBody);
 
