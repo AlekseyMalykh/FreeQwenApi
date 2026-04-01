@@ -1,5 +1,5 @@
 import express from 'express';
-import { sendMessage, getAllModels, getApiKeys, createChatV2, pollTaskStatus, pagePool, extractAuthToken } from './chat.js';
+import { sendMessage, sendMessageWithTools, getAllModels, getApiKeys, createChatV2, pollTaskStatus, pagePool, extractAuthToken } from './chat.js';
 import { getAuthenticationStatus, getBrowserContext } from '../browser/browser.js';
 import { checkAuthentication } from '../browser/auth.js';
 import { logInfo, logError, logDebug } from '../logger/index.js';
@@ -316,39 +316,85 @@ router.use((req, res, next) => {
 
 // ─── Helpers: message parsing ────────────────────────────────────────────────
 
+
+function normalizeOpenAIMessageContent(content) {
+    if (!Array.isArray(content)) return content;
+
+    return content.map(item => {
+        if (item.type === 'text') {
+            return { type: 'text', text: item.text };
+        } else if (item.type === 'image_url' && item.image_url) {
+            return { type: 'image', image: item.image_url.url };
+        } else if (item.type === 'image') {
+            return { type: 'image', image: item.image };
+        }
+        return item;
+    });
+}
+
 function parseOpenAIMessages(messages) {
     const systemMsg = messages.find(msg => msg.role === 'system');
     const systemMessage = systemMsg ? systemMsg.content : null;
+    const nonSystemMessages = messages.filter(msg => msg && msg.role !== 'system');
     const lastUserMessage = messages.filter(msg => msg.role === 'user').pop();
-    
-    if (!lastUserMessage) {
-        return { messageContent: null, systemMessage };
+    const lastToolMessage = messages.filter(msg => msg.role === 'tool').pop();
+    const activeMessage = lastToolMessage || lastUserMessage;
+
+    if (!activeMessage && nonSystemMessages.length === 0) {
+        return { messageContent: null, systemMessage, conversationPayload: null, files: [] };
     }
-    
-    let messageContent = lastUserMessage.content;
-    
-    // Преобразуем OpenAI format content array во внутренний формат
-    if (Array.isArray(messageContent)) {
-        messageContent = messageContent.map(item => {
-            if (item.type === 'text') {
-                return { type: 'text', text: item.text };
-            } else if (item.type === 'image_url' && item.image_url) {
-                // OpenAI format: image_url: { url: '...' }
-                return { type: 'image', image: item.image_url.url };
-            } else if (item.type === 'image') {
-                // Уже во внутреннем формате
-                return { type: 'image', image: item.image };
-            }
-            return item;
-        });
-    }
-    
-    return { messageContent, systemMessage };
+
+    const conversationMessages = nonSystemMessages.map(msg => {
+        const normalized = {
+            role: msg.role,
+            content: normalizeOpenAIMessageContent(msg.content)
+        };
+
+        if (Array.isArray(msg.tool_calls)) normalized.tool_calls = msg.tool_calls;
+        if (msg.tool_call_id) normalized.tool_call_id = msg.tool_call_id;
+        if (msg.name) normalized.name = msg.name;
+        if (Array.isArray(msg.files)) normalized.files = msg.files;
+
+        return normalized;
+    });
+
+    return {
+        messageContent: normalizeOpenAIMessageContent(activeMessage?.content ?? null),
+        systemMessage,
+        conversationPayload: { __conversation: true, messages: conversationMessages },
+        files: Array.isArray(lastUserMessage?.files) ? lastUserMessage.files : []
+    };
 }
+
 
 function buildCombinedTools(tools, functions, toolChoice) {
     const combinedTools = tools || (functions ? functions.map(fn => ({ type: 'function', function: fn })) : null);
     return { combinedTools, toolChoice };
+}
+
+
+function writeToolCallChunks(writeSse, mappedModel, toolCalls) {
+    if (!Array.isArray(toolCalls) || toolCalls.length === 0) return;
+
+    writeSse({
+        id: 'chatcmpl-stream', object: 'chat.completion.chunk',
+        created: Math.floor(Date.now() / 1000), model: mappedModel,
+        choices: [{
+            index: 0,
+            delta: {
+                tool_calls: toolCalls.map((toolCall, index) => ({
+                    index,
+                    id: toolCall.id,
+                    type: toolCall.type || 'function',
+                    function: {
+                        name: toolCall.function?.name || '',
+                        arguments: toolCall.function?.arguments || ''
+                    }
+                }))
+            },
+            finish_reason: null
+        }]
+    });
 }
 
 // ─── Helpers: streaming ──────────────────────────────────────────────────────
@@ -376,23 +422,41 @@ async function handleStreamingResponse(res, mappedModel, messageContent, chatId,
                 choices: [{ index: 0, delta: { content: `Error: ${result.error}` }, finish_reason: null }]
             });
         } else if (result.choices?.[0]?.message) {
-            const content = String(result.choices[0].message.content || '');
-            const codePoints = Array.from(content);
-            const chunkSize = 16;
-            for (let i = 0; i < codePoints.length; i += chunkSize) {
-                writeSse({
-                    id: 'chatcmpl-stream', object: 'chat.completion.chunk',
-                    created: Math.floor(Date.now() / 1000), model: mappedModel,
-                    choices: [{ index: 0, delta: { content: codePoints.slice(i, i + chunkSize).join('') }, finish_reason: null }]
-                });
-                await new Promise(r => setTimeout(r, STREAMING_CHUNK_DELAY));
+            const message = result.choices[0].message;
+            const responseToolCalls = Array.isArray(message.tool_calls) ? message.tool_calls : [];
+
+            // Если есть tool_calls — не стримим content вообще.
+            if (responseToolCalls.length === 0) {
+                const content = String(message.content || '');
+                const codePoints = Array.from(content);
+                const chunkSize = 16;
+
+                for (let i = 0; i < codePoints.length; i += chunkSize) {
+                    writeSse({
+                        id: 'chatcmpl-stream',
+                        object: 'chat.completion.chunk',
+                        created: Math.floor(Date.now() / 1000),
+                        model: mappedModel,
+                        choices: [{
+                            index: 0,
+                            delta: { content: codePoints.slice(i, i + chunkSize).join('') },
+                            finish_reason: null
+                        }]
+                    });
+                    await new Promise(r => setTimeout(r, STREAMING_CHUNK_DELAY));
+                }
             }
+        }
+
+        const responseToolCalls = result?.choices?.[0]?.message?.tool_calls || [];
+        if (responseToolCalls.length > 0) {
+            writeToolCallChunks(writeSse, mappedModel, responseToolCalls);
         }
 
         writeSse({
             id: 'chatcmpl-stream', object: 'chat.completion.chunk',
             created: Math.floor(Date.now() / 1000), model: mappedModel,
-            choices: [{ index: 0, delta: {}, finish_reason: 'stop' }]
+            choices: [{ index: 0, delta: {}, finish_reason: responseToolCalls.length > 0 ? 'tool_calls' : 'stop' }]
         });
         res.write('data: [DONE]\n\n');
         res.end();
@@ -539,6 +603,11 @@ router.post('/chat', async (req, res) => {
                 }
                 // Чанки уже были отправлены через streamingCallback, не дублируем!
 
+                const responseToolCalls = result?.choices?.[0]?.message?.tool_calls || [];
+                if (responseToolCalls.length > 0) {
+                    writeToolCallChunks(writeSse, mappedModel || 'qwen-max-latest', responseToolCalls);
+                }
+
                 // Финальный чанк
                 writeSse({
                     id: 'chatcmpl-' + Date.now(),
@@ -546,7 +615,7 @@ router.post('/chat', async (req, res) => {
                     created: Math.floor(Date.now() / 1000),
                     model: mappedModel || 'qwen-max-latest',
                     choices: [
-                        { index: 0, delta: {}, finish_reason: 'stop' }
+                        { index: 0, delta: {}, finish_reason: responseToolCalls.length > 0 ? 'tool_calls' : 'stop' }
                     ]
                 });
                 res.write('data: [DONE]\n\n');
@@ -744,35 +813,15 @@ router.post('/chat/completions', async (req, res) => {
             }
         }
 
-        // Извлекаем system message если есть
-        const systemMsg = messages.find(msg => msg.role === 'system');
-        const systemMessage = systemMsg ? systemMsg.content : null;
+        const parsedMessages = parseOpenAIMessages(messages);
+        const systemMessage = parsedMessages.systemMessage;
+        const messageContent = parsedMessages.conversationPayload || parsedMessages.messageContent;
+        const files = parsedMessages.files || [];
 
-        const lastUserMessage = messages.filter(msg => msg.role === 'user').pop();
-        if (!lastUserMessage) {
-            logError('В запросе нет сообщений от пользователя');
-            return res.status(400).json({ error: 'В запросе нет сообщений от пользователя' });
+        if (!messageContent) {
+            logError('В запросе нет сообщений для обработки');
+            return res.status(400).json({ error: 'В запросе нет сообщений для обработки' });
         }
-
-        let messageContent = lastUserMessage.content;
-        
-        // Преобразуем OpenAI format content array во внутренний формат
-        if (Array.isArray(messageContent)) {
-            messageContent = messageContent.map(item => {
-                if (item.type === 'text') {
-                    return { type: 'text', text: item.text };
-                } else if (item.type === 'image_url' && item.image_url) {
-                    // OpenAI format: image_url: { url: '...' }
-                    return { type: 'image', image: item.image_url.url };
-                } else if (item.type === 'image') {
-                    // Уже во внутреннем формате
-                    return { type: 'image', image: item.image };
-                }
-                return item;
-            });
-        }
-        
-        const files = lastUserMessage.files || []; // ← ИЗВЛЕКАЕМ FILES
 
         if (isMeta) {
             effectiveChatId = null;
@@ -815,31 +864,41 @@ router.post('/chat/completions', async (req, res) => {
             try {
                 const combinedTools = tools || (functions ? functions.map(fn => ({ type: 'function', function: fn })) : null);
                 const qwenChatId = await resolveQwenChatId(effectiveChatId, mappedModel);
+                const hasTools = Array.isArray(combinedTools) && combinedTools.length > 0;
 
                 // Setup streaming callback if stream=true
+                // When tools are present, buffer output to avoid sending raw JSON to client
                 let streamingCallback = null;
                 let hasStreamedChunks = false;
+                const bufferedChunks = [];
+                
                 if (stream) {
                     streamingCallback = (chunk) => {
                         hasStreamedChunks = true;
-                        writeSse({
-                            id: 'chatcmpl-stream',
-                            object: 'chat.completion.chunk',
-                            created: Math.floor(Date.now() / 1000),
-                            model: mappedModel || 'qwen-max-latest',
-                            choices: [
-                                { index: 0, delta: { content: chunk }, finish_reason: null }
-                            ]
-                        });
+                        if (hasTools) {
+                            bufferedChunks.push(chunk);
+                        } else {
+                            writeSse({
+                                id: 'chatcmpl-stream',
+                                object: 'chat.completion.chunk',
+                                created: Math.floor(Date.now() / 1000),
+                                model: mappedModel || 'qwen-max-latest',
+                                choices: [
+                                    { index: 0, delta: { content: chunk }, finish_reason: null }
+                                ]
+                            });
+                        }
                     };
                 }
 
-                const result = await sendMessage(
+                const sendFn = sendMessageWithTools; // Always use tool-aware version
+
+                const result = await sendFn(
                     messageContent,
                     mappedModel,
                     qwenChatId,
                     effectiveParentId,
-                    files, // ← ПЕРЕДАЁМ FILES
+                    files,
                     combinedTools,
                     tool_choice,
                     systemMessage,
@@ -852,7 +911,6 @@ router.post('/chat/completions', async (req, res) => {
 
                 // Сохраняем chatId в сессию для следующих запросов
                 if (!isMeta && result.chatId) {
-                    // Если мы использовали сгенерированный effectiveChatId — сохраните маппинг
                     if (effectiveChatId && effectiveChatId.startsWith('chat_') && result.chatId) {
                         mapChatId(effectiveChatId, result.chatId);
                         logDebug(`Маппинг сохранён: ${effectiveChatId} -> ${result.chatId}`);
@@ -872,13 +930,19 @@ router.post('/chat/completions', async (req, res) => {
                             { index: 0, delta: { content: `Error: ${result.error}` }, finish_reason: null }
                         ]
                     });
-                } else if (!hasStreamedChunks && result.choices && result.choices[0] && result.choices[0].message && result.choices[0].message.content) {
-                    // Qwen вернул JSON вместо SSE - отправляем контент одним чанком
+                } else if (result.choices && result.choices[0] && result.choices[0].message && result.choices[0].message.content) {
                     const content = result.choices[0].message.content;
-                    logDebug(`JSON response content length: ${content.length}`);
-                    if (typeof streamingCallback === 'function') {
-                        streamingCallback(content);
-                    }
+                    logDebug(`Response content length: ${content.length}, streamed: ${hasStreamedChunks}, hasTools: ${hasTools}`);
+                    // Send final content (including tool results)
+                    writeSse({
+                        id: 'chatcmpl-stream',
+                        object: 'chat.completion.chunk',
+                        created: Math.floor(Date.now() / 1000),
+                        model: mappedModel || 'qwen-max-latest',
+                        choices: [
+                            { index: 0, delta: { content }, finish_reason: null }
+                        ]
+                    });
                 } else {
                     logDebug(`Result structure: ${JSON.stringify(Object.keys(result))}`);
                 }
@@ -913,7 +977,9 @@ router.post('/chat/completions', async (req, res) => {
         } else {
             const combinedTools = tools || (functions ? functions.map(fn => ({ type: 'function', function: fn })) : null);
             const qwenChatId = await resolveQwenChatId(effectiveChatId, mappedModel);
-            const result = await sendMessage(messageContent, mappedModel, qwenChatId, effectiveParentId, null, combinedTools, tool_choice, systemMessage);
+            const useToolLoop = Array.isArray(combinedTools) && combinedTools.length > 0;
+            const sendFn = useToolLoop ? sendMessageWithTools : sendMessage;
+            const result = await sendFn(messageContent, mappedModel, qwenChatId, effectiveParentId, null, combinedTools, tool_choice, systemMessage);
 
             // Сохраняем chatId в сессию для следующих запросов
             if (!isMeta && result.chatId) {
@@ -1042,35 +1108,15 @@ router.post('/v1/chat/completions', async (req, res) => {
             }
         }
 
-        // Извлекаем system message если есть
-        const systemMsg = messages.find(msg => msg.role === 'system');
-        const systemMessage = systemMsg ? systemMsg.content : null;
+        const parsedMessages = parseOpenAIMessages(messages);
+        const systemMessage = parsedMessages.systemMessage;
+        const messageContent = parsedMessages.conversationPayload || parsedMessages.messageContent;
+        const files = parsedMessages.files || [];
 
-        const lastUserMessage = messages.filter(msg => msg.role === 'user').pop();
-        if (!lastUserMessage) {
-            logError('В запросе нет сообщений от пользователя');
-            return res.status(400).json({ error: 'В запросе нет сообщений от пользователя' });
+        if (!messageContent) {
+            logError('В запросе нет сообщений для обработки');
+            return res.status(400).json({ error: 'В запросе нет сообщений для обработки' });
         }
-
-        let messageContent = lastUserMessage.content;
-        
-        // Преобразуем OpenAI format content array во внутренний формат
-        if (Array.isArray(messageContent)) {
-            messageContent = messageContent.map(item => {
-                if (item.type === 'text') {
-                    return { type: 'text', text: item.text };
-                } else if (item.type === 'image_url' && item.image_url) {
-                    // OpenAI format: image_url: { url: '...' }
-                    return { type: 'image', image: item.image_url.url };
-                } else if (item.type === 'image') {
-                    // Уже во внутреннем формате
-                    return { type: 'image', image: item.image };
-                }
-                return item;
-            });
-        }
-        
-        const files = lastUserMessage.files || []; // ← ИЗВЛЕКАЕМ FILES
 
         if (isMeta) {
             effectiveChatId = null;
@@ -1130,12 +1176,15 @@ router.post('/v1/chat/completions', async (req, res) => {
                     };
                 }
                 
-                const result = await sendMessage(
+                const useToolLoop = Array.isArray(combinedTools) && combinedTools.length > 0;
+                const sendFn = useToolLoop ? sendMessageWithTools : sendMessage;
+                
+                const result = await sendFn(
                     messageContent,
                     mappedModel,
                     qwenChatId,
                     effectiveParentId,
-                    files, // ← ИЗВЛЕКАЕМ FILES
+                    files,
                     combinedTools,
                     tool_choice,
                     systemMessage,
@@ -1205,7 +1254,10 @@ router.post('/v1/chat/completions', async (req, res) => {
             const combinedTools = tools || (functions ? functions.map(fn => ({ type: 'function', function: fn })) : null);
             const qwenChatId = await resolveQwenChatId(effectiveChatId, mappedModel);
 
-            const result = await sendMessage(messageContent, mappedModel, qwenChatId, effectiveParentId, files, combinedTools, tool_choice, systemMessage);
+            const useToolLoop = Array.isArray(combinedTools) && combinedTools.length > 0;
+            const sendFn = useToolLoop ? sendMessageWithTools : sendMessage;
+
+            const result = await sendFn(messageContent, mappedModel, qwenChatId, effectiveParentId, files, combinedTools, tool_choice, systemMessage);
 
             // Сохраняем chatId в сессии для следующих запросов
             if (!isMeta && result.chatId) {
