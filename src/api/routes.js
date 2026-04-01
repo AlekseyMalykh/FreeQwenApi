@@ -916,6 +916,7 @@ router.post('/chat/completions', async (req, res) => {
                 res.end();
             }
         } else {
+            const clientWorkdir = req.headers['x-working-directory'] || req.headers['x-workdir'] || null;
             const combinedTools = tools || (functions ? functions.map(fn => ({ type: 'function', function: fn })) : null);
             const qwenChatId = await resolveQwenChatId(effectiveChatId, mappedModel);
             const result = await sendMessage(messageContent, mappedModel, qwenChatId, effectiveParentId, null, combinedTools, tool_choice, systemMessage, 't2t', null, true, 0, null, clientWorkdir);

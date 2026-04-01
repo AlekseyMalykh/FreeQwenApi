@@ -55,3 +55,6 @@ export const ALLOW_UNSCOPED_SESSION_CHAT_RESTORE = toBoolean(process.env.ALLOW_U
 export const LOG_LEVEL = process.env.LOG_LEVEL || 'info';
 export const LOG_MAX_SIZE = Number(process.env.LOG_MAX_SIZE) || 5_242_880; // 5 MB
 export const LOG_MAX_FILES = Number(process.env.LOG_MAX_FILES) || 5;
+
+// ─── Tools (experimental) ────────────────────────────────────────────────────
+export const ENABLE_BASH_TOOL = toBoolean(process.env.ENABLE_BASH_TOOL);

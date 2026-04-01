@@ -3,6 +3,7 @@ import path from 'path';
 import { spawn } from 'child_process';
 import { fileURLToPath } from 'url';
 import { logInfo, logError, logDebug, logWarn } from '../logger/index.js';
+import { ENABLE_BASH_TOOL } from '../config.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -228,6 +229,12 @@ export async function executeTool(toolName, args, clientWorkdir = null) {
     }
     if (clientWorkdir && !normalized.arguments.workdir) {
         normalized.arguments.workdir = clientWorkdir;
+    }
+    
+    // Safety: block bash if not explicitly enabled
+    if (normalized.name === 'bash' && !ENABLE_BASH_TOOL) {
+        logWarn('bash tool blocked — set ENABLE_BASH_TOOL=1 to enable');
+        return { success: false, error: 'bash tool is disabled. Set ENABLE_BASH_TOOL=1 to enable.' };
     }
     
     const executor = TOOL_EXECUTORS[normalized.name];

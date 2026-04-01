@@ -1277,6 +1277,113 @@ const response = await client.chat.completions.create({
 
 ---
 
+## 🛠️ Инструменты (Tools) — Experimental
+
+> ⚠️ **⚠️ Experimental feature: tool execution is stateless and may produce inconsistent results.**
+> ⚠️ **⚠️ The bash tool is DANGEROUS — it executes arbitrary shell commands on the server.**
+> ⚠️ **Only use in trusted local environments. NEVER expose this publicly.**
+
+### Как это работает
+
+Бесплатный Qwen API не поддерживает OpenAI-style function calling нативно. Прокси эмулирует эту функциональность:
+
+1. Клиент отправляет запрос с `tools` (OpenAI-формат)
+2. Прокси добавляет описание инструментов в system prompt
+3. Модель отвечает текстовым вызовом инструмента (не JSON!)
+4. Прокси выполняет инструмент локально
+5. **Результаты возвращаются напрямую клиенту** (не обратно в модель)
+
+> **Важно:** Qwen API v2 не поддерживает multi-turn с tool results. Результаты инструментов возвращаются напрямую клиенту, без повторного запроса к модели. Это означает, что модель не видит результат и не может на его основе строить дальнейшие действия.
+
+### Доступные инструменты
+
+| Инструмент | Описание | Пример |
+|------------|----------|--------|
+| `bash` | Выполнение shell-команд | `git status`, `npm install` |
+| `read_file` | Чтение файлов | `README.md`, `src/index.js` |
+| `write_file` | Запись в файлы | Создание новых файлов |
+| `edit_file` | Редактирование файлов | Замена текста в файле |
+| `glob` | Поиск файлов по паттерну | `**/*.ts`, `src/**/*.js` |
+| `grep` | Поиск по содержимому файлов | Найти все `import` |
+
+### Как передавать рабочую директорию
+
+Прокси не знает, в какой папке работает клиент. Передавайте абсолютные пути или заголовок:
+
+```
+X-Working-Directory: C:/Projects/my-app
+```
+
+или
+
+```
+X-Workdir: /home/user/project
+```
+
+Если заголовок не передан, используется `process.cwd()` сервера.
+
+### Формат вызова инструментов
+
+Модель отвечает в текстовом формате (не JSON):
+
+```
+TOOL_CALL: bash
+ARG command: git status
+ARG workdir: C:/Projects/app
+END_TOOL
+```
+
+### Безопасность
+
+> **bash отключён по умолчанию.** Для включения установите:
+> ```bash
+> ENABLE_BASH_TOOL=1 npm start
+> ```
+> 
+> - Не запускайте прокси с правами root/administrator
+> - Будьте осторожны с деструктивными командами (`rm`, `del`, `git reset --hard`)
+> - В продакшене рекомендуется ограничить доступ к эндпоинтам
+> - Используйте только в доверенной локальной среде
+
+### Пример с OpenAI SDK
+
+```javascript
+import OpenAI from 'openai';
+
+const client = new OpenAI({
+    baseURL: 'http://localhost:3264/api',
+    apiKey: 'any-string',
+});
+
+const response = await client.chat.completions.create({
+    model: 'qwen-max-latest',
+    messages: [
+        { role: 'user', content: 'Покажи статус git репозитория' }
+    ],
+    tools: [
+        {
+            type: 'function',
+            function: {
+                name: 'bash',
+                description: 'Execute a shell command',
+                parameters: {
+                    type: 'object',
+                    properties: {
+                        command: { type: 'string', description: 'The command to execute' }
+                    },
+                    required: ['command']
+                }
+            }
+        }
+    ]
+});
+
+console.log(response.choices[0].message.content);
+// Выведет результат выполнения "git status"
+```
+
+---
+
 ## Python (Альтернативная реализация)
 
 Проект также включает полную реализацию на Python, которая работает независимо от Node.js.
