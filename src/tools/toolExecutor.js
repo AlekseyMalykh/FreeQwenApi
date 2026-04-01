@@ -2,12 +2,60 @@ import fs from 'fs';
 import path from 'path';
 import { spawn } from 'child_process';
 import { fileURLToPath } from 'url';
+import crypto from 'crypto';
 import { logInfo, logError, logDebug, logWarn } from '../logger/index.js';
 import { ENABLE_BASH_TOOL } from '../config.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const PROJECT_ROOT = path.resolve(__dirname, '../..');
+
+// ─── Pending patch storage ───────────────────────────────────────────────────
+const pendingPatches = new Map();
+const PATCH_TTL = 10 * 60 * 1000; // 10 minutes
+
+export function getPendingPatch(patchId) {
+    const entry = pendingPatches.get(patchId);
+    if (!entry) return null;
+    if (Date.now() > entry.expiresAt) {
+        pendingPatches.delete(patchId);
+        return null;
+    }
+    return entry;
+}
+
+export function createPendingPatch(patchData) {
+    const id = `patch_${crypto.randomUUID().substring(0, 8)}`;
+    pendingPatches.set(id, {
+        id,
+        ...patchData,
+        status: 'pending',
+        createdAt: Date.now(),
+        expiresAt: Date.now() + PATCH_TTL
+    });
+    return id;
+}
+
+export function confirmPendingPatch(patchId) {
+    const entry = pendingPatches.get(patchId);
+    if (!entry) return { success: false, error: 'Patch not found or expired' };
+    if (entry.status !== 'pending') return { success: false, error: `Patch already ${entry.status}` };
+    entry.status = 'confirmed';
+    return { success: true, patch: entry };
+}
+
+export function rejectPendingPatch(patchId) {
+    pendingPatches.delete(patchId);
+    return { success: true };
+}
+
+// Cleanup expired patches every 5 minutes
+setInterval(() => {
+    const now = Date.now();
+    for (const [id, entry] of pendingPatches) {
+        if (now > entry.expiresAt) pendingPatches.delete(id);
+    }
+}, 5 * 60 * 1000).unref();
 
 export const TOOL_DEFINITIONS = {
     bash: {
@@ -84,12 +132,24 @@ export const TOOL_DEFINITIONS = {
     },
     apply_patch: {
         name: 'apply_patch',
-        description: 'Apply a unified diff patch to a file. Use this instead of write_file for code changes.',
+        description: 'Apply a pending patch by ID. The patch must have been proposed first and confirmed by the user.',
         parameters: {
             type: 'object',
             properties: {
-                path: { type: 'string', description: 'Absolute path to the file to patch' },
-                patch: { type: 'string', description: 'Unified diff content (--- a/file ... +++ b/file ...)' }
+                patch_id: { type: 'string', description: 'The patch ID returned from propose_patch' }
+            },
+            required: ['patch_id']
+        }
+    },
+    propose_patch: {
+        name: 'propose_patch',
+        description: 'Propose a code change as a unified diff. The user will review and confirm before it is applied. Use this instead of write_file or edit_file for code modifications.',
+        parameters: {
+            type: 'object',
+            properties: {
+                path: { type: 'string', description: 'Absolute path to the file to modify' },
+                patch: { type: 'string', description: 'Unified diff content (--- a/file ... +++ b/file ...)' },
+                description: { type: 'string', description: 'Human-readable description of the change' }
             },
             required: ['path', 'patch']
         }
@@ -215,11 +275,41 @@ function applyUnifiedDiff(original, patch) {
 function hunkMatchesAt(hunk, content, pos) {
     const contextLines = hunk.lines.filter(l => l.startsWith('-') || l.startsWith(' '));
     for (let i = 0; i < contextLines.length; i++) {
-        const expected = contextLines[i].substring(1); // remove - or + prefix
+        const expected = contextLines[i].substring(1);
         const actual = content[pos + i];
         if (actual !== expected) return false;
     }
     return true;
+}
+
+function generateDiffPreview(original, modified, filePath) {
+    const origLines = original.split('\n');
+    const modLines = modified.split('\n');
+    const lines = [];
+    
+    const maxLen = Math.max(origLines.length, modLines.length);
+    let inHunk = false;
+    
+    for (let i = 0; i < maxLen; i++) {
+        const orig = i < origLines.length ? origLines[i] : undefined;
+        const mod = i < modLines.length ? modLines[i] : undefined;
+        
+        if (orig === mod) {
+            if (inHunk) {
+                lines.push(`  ${orig}`);
+                // Close hunk after 3 context lines
+                if (lines.filter(l => l.startsWith(' ')).slice(-3).every(l => l.trim())) {
+                    // Keep showing context
+                }
+            }
+        } else {
+            inHunk = true;
+            if (orig !== undefined) lines.push(`- ${orig}`);
+            if (mod !== undefined) lines.push(`+ ${mod}`);
+        }
+    }
+    
+    return lines.slice(0, 50).join('\n') + (lines.length > 50 ? '\n...' : '');
 }
 
 function normalizeToolCall(toolName, args) {
@@ -308,7 +398,7 @@ END_TOOL
 
 User: "добавь console.log в main.js"
 You:
-TOOL_CALL: apply_patch
+TOOL_CALL: propose_patch
 ARG path: C:/Projects/app/main.js
 ARG patch: --- a/main.js
 +++ b/main.js
@@ -316,7 +406,11 @@ ARG patch: --- a/main.js
  console.log('start')
 +console.log('added')
  console.log('end')
+ARG description: Add console.log statement
 END_TOOL
+
+IMPORTANT: For code changes, ALWAYS use propose_patch instead of write_file or edit_file.
+The user will see the diff preview and must confirm before the patch is applied.
 
 Available tools:
 ${toolList}`;
@@ -433,22 +527,53 @@ const TOOL_EXECUTORS = {
         return { success: true, output: `Edited ${filePath}` };
     },
 
-    async apply_patch({ path: filePath, patch }) {
+    async propose_patch({ path: filePath, patch, description }) {
         const resolved = path.resolve(filePath);
         if (!fs.existsSync(resolved)) return { success: false, error: `File not found: ${filePath}` };
         
         try {
-            // Parse unified diff and apply it
             const original = fs.readFileSync(resolved, 'utf-8');
             const result = applyUnifiedDiff(original, patch);
             
-            if (result.success) {
-                fs.writeFileSync(resolved, result.content, 'utf-8');
-                return { success: true, output: `Patch applied to ${filePath}\n${result.summary}` };
-            }
-            return { success: false, error: result.error };
+            if (!result.success) return { success: false, error: result.error };
+            
+            // Store as pending patch
+            const patchId = createPendingPatch({
+                path: filePath,
+                resolvedPath: resolved,
+                patch,
+                description: description || 'Code modification',
+                originalContent: original,
+                newContent: result.content,
+                summary: result.summary
+            });
+            
+            // Generate diff preview for user
+            const diffPreview = generateDiffPreview(original, result.content, filePath);
+            
+            return {
+                success: true,
+                patch_id: patchId,
+                output: `Patch proposed (ID: ${patchId})\n${result.summary}\n\nPreview:\n${diffPreview}\n\nThe user must confirm this patch before it is applied.`,
+                patch_id_for_client: patchId,
+                diff_preview: diffPreview
+            };
         } catch (e) {
-            return { success: false, error: `Patch failed: ${e.message}` };
+            return { success: false, error: `Patch proposal failed: ${e.message}` };
+        }
+    },
+
+    async apply_patch({ patch_id }) {
+        const entry = getPendingPatch(patch_id);
+        if (!entry) return { success: false, error: `Patch ${patch_id} not found or expired` };
+        if (entry.status !== 'confirmed') return { success: false, error: `Patch ${patch_id} is not confirmed (status: ${entry.status})` };
+        
+        try {
+            fs.writeFileSync(entry.resolvedPath, entry.newContent, 'utf-8');
+            pendingPatches.delete(patch_id);
+            return { success: true, output: `Patch applied to ${entry.path}\n${entry.summary}` };
+        } catch (e) {
+            return { success: false, error: `Patch apply failed: ${e.message}` };
         }
     },
 

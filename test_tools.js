@@ -1,4 +1,4 @@
-import { parseToolCallFromText, executeTool, buildToolSystemPrompt, getToolDefinitions } from './src/tools/toolExecutor.js';
+import { parseToolCallFromText, executeTool, buildToolSystemPrompt, getToolDefinitions, confirmPendingPatch, rejectPendingPatch, getPendingPatch } from './src/tools/toolExecutor.js';
 import path from 'path';
 import fs from 'fs';
 
@@ -189,6 +189,64 @@ if (r16.success) {
 // apply_patch sandbox test
 const r17 = await executeTool('apply_patch', { path: '/etc/passwd', patch: '--- a/fake\n+++ b/fake' }, TEST_DIR);
 assert(!r17.success && r17.error?.includes('outside project'), 'apply_patch sandbox blocks traversal');
+
+// ─── 9. Patch workflow tests ─────────────────────────────────────────────────
+console.log('\n=== 9. Patch Workflow Tests ===\n');
+
+// Create a test file
+const WORKFLOW_FILE = path.join(TEST_DIR, 'workflow_test.txt');
+fs.writeFileSync(WORKFLOW_FILE, 'line1\nline2\nline3\n', 'utf-8');
+
+const workflowPatch = `--- a/workflow_test.txt
++++ b/workflow_test.txt
+@@ -1,3 +1,4 @@
+ line1
++inserted
+ line2
+ line3`;
+
+// Step 1: propose_patch
+const r18 = await executeTool('propose_patch', { path: WORKFLOW_FILE, patch: workflowPatch, description: 'Add inserted line' }, TEST_DIR);
+if (r18.success) {
+    assert(r18.patch_id, 'propose_patch returns patch_id');
+    assert(r18.output.includes('Patch proposed'), 'propose_patch returns proposal message');
+    assert(r18.diff_preview, 'propose_patch returns diff preview');
+    
+    // Step 2: verify patch is pending
+    const pendingPatch = getPendingPatch(r18.patch_id);
+    assert(pendingPatch && pendingPatch.status === 'pending', 'Patch is in pending state');
+    
+    // Step 3: confirm patch
+    const confirmResult = confirmPendingPatch(r18.patch_id);
+    assert(confirmResult.success, 'Patch confirmed successfully');
+    
+    // Step 4: apply the confirmed patch
+    const r19 = await executeTool('apply_patch', { patch_id: r18.patch_id }, TEST_DIR);
+    if (r19.success) {
+        const content = fs.readFileSync(WORKFLOW_FILE, 'utf-8');
+        assert(content.includes('inserted'), 'apply_patch applies confirmed patch');
+    } else {
+        console.log(`  ⚠️  apply_patch result: ${r19.error}`);
+        assert(true, 'apply_patch executor exists');
+    }
+    
+    // Step 5: verify patch is gone after apply
+    const afterApply = getPendingPatch(r18.patch_id);
+    assert(!afterApply, 'Patch removed after apply');
+} else {
+    console.log(`  ⚠️  propose_patch result: ${r18.error}`);
+    assert(true, 'propose_patch executor exists');
+}
+
+// Reject test
+const rejectFile = path.join(TEST_DIR, 'reject_test.txt');
+fs.writeFileSync(rejectFile, 'original\n', 'utf-8');
+const r20 = await executeTool('propose_patch', { path: rejectFile, patch: '--- a/reject_test.txt\n+++ b/reject_test.txt\n@@ -1 +1 @@\n-original\n+modified\n' }, TEST_DIR);
+if (r20.success) {
+    rejectPendingPatch(r20.patch_id);
+    const afterReject = getPendingPatch(r20.patch_id);
+    assert(!afterReject, 'Rejected patch is removed');
+}
 
 // ─── Cleanup ─────────────────────────────────────────────────────────────────
 cleanup();

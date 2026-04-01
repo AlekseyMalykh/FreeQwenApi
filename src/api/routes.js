@@ -8,6 +8,7 @@ import { getStsToken, uploadFileToQwen } from './fileUpload.js';
 import { loadHistory, saveHistory } from './chatHistory.js';
 import { generateImage, getAvailableImageModels, checkImageApiAvailability } from './imageGeneration.js';
 import { MAX_FILE_SIZE, UPLOADS_DIR, DEFAULT_MODEL, STREAMING_CHUNK_DELAY, ALLOW_UNSCOPED_SESSION_CHAT_RESTORE } from '../config.js';
+import { confirmPendingPatch, rejectPendingPatch, getPendingPatch } from '../tools/toolExecutor.js';
 import multer from 'multer';
 import path from 'path';
 import fs from 'fs';
@@ -1511,6 +1512,49 @@ router.get('/images/status', async (req, res) => {
     } catch (error) {
         logError('Ошибка при проверке статуса API изображений', error);
         res.status(500).json({ error: 'Внутренняя ошибка сервера' });
+    }
+});
+
+/**
+ * GET /api/tools/patches/:id - Get pending patch details
+ */
+router.get('/tools/patches/:id', async (req, res) => {
+    try {
+        const patch = getPendingPatch(req.params.id);
+        if (!patch) return res.status(404).json({ error: 'Patch not found or expired' });
+        res.json(patch);
+    } catch (error) {
+        logError('Error getting patch', error);
+        res.status(500).json({ error: 'Internal server error' });
+    }
+});
+
+/**
+ * POST /api/tools/patches/:id/confirm - Confirm a pending patch
+ */
+router.post('/tools/patches/:id/confirm', async (req, res) => {
+    try {
+        const result = confirmPendingPatch(req.params.id);
+        if (!result.success) return res.status(400).json({ error: result.error });
+        logInfo(`Patch ${req.params.id} confirmed`);
+        res.json({ success: true, message: 'Patch confirmed', patch: result.patch });
+    } catch (error) {
+        logError('Error confirming patch', error);
+        res.status(500).json({ error: 'Internal server error' });
+    }
+});
+
+/**
+ * POST /api/tools/patches/:id/reject - Reject a pending patch
+ */
+router.post('/tools/patches/:id/reject', async (req, res) => {
+    try {
+        rejectPendingPatch(req.params.id);
+        logInfo(`Patch ${req.params.id} rejected`);
+        res.json({ success: true, message: 'Patch rejected' });
+    } catch (error) {
+        logError('Error rejecting patch', error);
+        res.status(500).json({ error: 'Internal server error' });
     }
 });
 
