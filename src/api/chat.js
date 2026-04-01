@@ -14,6 +14,12 @@ import {
     DEFAULT_MODEL, MAX_RETRY_COUNT,
     TASK_POLL_MAX_ATTEMPTS, TASK_POLL_INTERVAL
 } from '../config.js';
+import {
+    executeTool,
+    parseToolCallFromText,
+    buildToolSystemPrompt,
+    getToolDefinitions
+} from '../tools/toolExecutor.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -763,7 +769,7 @@ async function handleApiError(response, tokenObj, message, model, chatId, parent
 
 // ─── Main public API ─────────────────────────────────────────────────────────
 
-export async function sendMessage(message, model = DEFAULT_MODEL, chatId = null, parentId = null, files = null, tools = null, toolChoice = null, systemMessage = null, chatType = 't2t', size = null, waitForCompletion = true, retryCount = 0, onChunk = null) {
+export async function sendMessage(message, model = DEFAULT_MODEL, chatId = null, parentId = null, files = null, tools = null, toolChoice = null, systemMessage = null, chatType = 't2t', size = null, waitForCompletion = true, retryCount = 0, onChunk = null, clientWorkdir = null) {
     if (!availableModels) availableModels = getAvailableModelsFromFile();
 
     if (!chatId) {
@@ -778,7 +784,7 @@ export async function sendMessage(message, model = DEFAULT_MODEL, chatId = null,
         logError(validated.error);
         return { error: validated.error, chatId };
     }
-    const messageContent = validated.content;
+    let messageContent = validated.content;
 
     if (!model || model.trim() === '') {
         model = DEFAULT_MODEL;
@@ -798,119 +804,201 @@ export async function sendMessage(message, model = DEFAULT_MODEL, chatId = null,
     const tokenObj = await resolveAuthToken(browserContext);
     if (!tokenObj) return { error: 'Ошибка авторизации: не удалось получить токен', chatId };
 
-    let page = null;
-    try {
-        page = await pagePool.getPage(browserContext);
+    // Inject tool descriptions into system message
+    const hasTools = Array.isArray(tools) && tools.length > 0;
+    let effectiveSystemMessage = systemMessage || '';
+    if (hasTools) {
+        const toolPrompt = buildToolSystemPrompt(tools);
+        effectiveSystemMessage = effectiveSystemMessage
+            ? `${effectiveSystemMessage}\n\n${toolPrompt}`
+            : toolPrompt;
+        logInfo(`Tool system prompt injected (${toolPrompt.length} chars)`);
+    }
 
-        const verificationNeeded = await checkVerification(page);
-        if (verificationNeeded) {
-            await page.reload({ waitUntil: 'domcontentloaded', timeout: PAGE_TIMEOUT });
-        }
+    // Buffer streaming when tools are present
+    const bufferedChunks = [];
+    let streamingCallback = onChunk;
+    if (hasTools && typeof onChunk === 'function') {
+        streamingCallback = (chunk) => { bufferedChunks.push(chunk); };
+    }
 
-        if (!authToken) {
-            logWarn('Токен отсутствует перед отправкой запроса');
-            authToken = await page.evaluate(() => localStorage.getItem('token'));
-            if (!authToken) return { error: 'Токен авторизации не найден. Требуется перезапуск в ручном режиме.', chatId };
-            saveAuthToken(authToken);
-        }
+    let currentParentId = parentId;
 
-        logInfo('Отправка запроса к API v2...');
+    for (let round = 0; round <= 1; round++) {
+        logInfo(`=== Tool execution round ${round} ===`);
 
-        const payload = buildPayloadV2(messageContent, model, chatId, parentId, files, systemMessage, tools, toolChoice, chatType, size);
-        logDebug('=== PAYLOAD V2 ===\n' + JSON.stringify(payload, null, 2));
-        logDebug(`Отправка сообщения в чат ${chatId} с parent_id: ${parentId || 'null'}`);
+        let page = null;
+        try {
+            page = await pagePool.getPage(browserContext);
 
-        const apiUrl = `${CHAT_API_URL}?chat_id=${chatId}`;
-        const response = await executeApiRequest(page, apiUrl, payload, authToken, onChunk);
-
-        if (response.success && response.isTask) {
-            logInfo('Обнаружен ответ с задачей (видеогенерация)');
-            logRaw(JSON.stringify(response.data));
-
-            const taskId = extractTaskId(response.data);
-            if (!taskId) {
-                logError('Task ID не найден в ответе');
-                pagePool.releasePage(page);
-                page = null;
-                return { error: 'Task ID not found in response', chatId, rawResponse: response.data };
+            const verificationNeeded = await checkVerification(page);
+            if (verificationNeeded) {
+                await page.reload({ waitUntil: 'domcontentloaded', timeout: PAGE_TIMEOUT });
             }
 
-            logInfo(`Task ID: ${taskId}`);
-
-            if (!waitForCompletion) {
-                logInfo('Возвращаем task_id для клиентского polling');
-                pagePool.releasePage(page);
-                page = null;
-                return {
-                    id: taskId,
-                    object: 'chat.completion.task',
-                    created: Math.floor(Date.now() / 1000),
-                    model,
-                    task_id: taskId,
-                    chatId,
-                    parentId: response.data.data?.parent_id || taskId,
-                    status: 'processing',
-                    message: 'Video generation task created. Poll GET /api/tasks/status/:taskId for progress.'
-                };
+            if (!authToken) {
+                logWarn('Токен отсутствует перед отправкой запроса');
+                authToken = await page.evaluate(() => localStorage.getItem('token'));
+                if (!authToken) return { error: 'Токен авторизации не найден. Требуется перезапуск в ручном режиме.', chatId };
+                saveAuthToken(authToken);
             }
 
-            logInfo('Начинаем polling для получения видео...');
-            const taskResult = await pollTaskStatus(taskId, page, authToken);
+            logInfo('Отправка запроса к API v2...');
+
+            const payload = buildPayloadV2(messageContent, model, chatId, currentParentId, files, effectiveSystemMessage, tools, toolChoice, chatType, size);
+            logDebug('=== PAYLOAD V2 ===\n' + JSON.stringify(payload, null, 2));
+
+            const apiUrl = `${CHAT_API_URL}?chat_id=${chatId}`;
+            const response = await executeApiRequest(page, apiUrl, payload, authToken, streamingCallback);
+
+            if (response.success && response.isTask) {
+                logInfo('Обнаружен ответ с задачей (видеогенерация)');
+                logRaw(JSON.stringify(response.data));
+
+                const taskId = extractTaskId(response.data);
+                if (!taskId) {
+                    logError('Task ID не найден в ответе');
+                    pagePool.releasePage(page);
+                    page = null;
+                    return { error: 'Task ID not found in response', chatId, rawResponse: response.data };
+                }
+
+                logInfo(`Task ID: ${taskId}`);
+
+                if (!waitForCompletion) {
+                    logInfo('Возвращаем task_id для клиентского polling');
+                    pagePool.releasePage(page);
+                    page = null;
+                    return {
+                        id: taskId,
+                        object: 'chat.completion.task',
+                        created: Math.floor(Date.now() / 1000),
+                        model,
+                        task_id: taskId,
+                        chatId,
+                        parentId: response.data.data?.parent_id || taskId,
+                        status: 'processing',
+                        message: 'Video generation task created. Poll GET /api/tasks/status/:taskId for progress.'
+                    };
+                }
+
+                logInfo('Начинаем polling для получения видео...');
+                const taskResult = await pollTaskStatus(taskId, page, authToken);
+
+                pagePool.releasePage(page);
+                page = null;
+
+                if (taskResult.success && taskResult.status === 'completed') {
+                    logInfo('Видео успешно сгенерировано');
+                    const videoUrl = extractVideoUrl(taskResult.data);
+                    return {
+                        id: taskId,
+                        object: 'chat.completion',
+                        created: Math.floor(Date.now() / 1000),
+                        model,
+                        choices: [{
+                            index: 0,
+                            message: { role: 'assistant', content: videoUrl || JSON.stringify(taskResult.data) },
+                            finish_reason: 'stop'
+                        }],
+                        usage: taskResult.data.usage || { prompt_tokens: 0, output_tokens: 0, total_tokens: 0 },
+                        response_id: taskId,
+                        chatId,
+                        parentId: taskId,
+                        task_id: taskId,
+                        video_url: videoUrl
+                    };
+                }
+
+                logError(`Не удалось получить видео: ${taskResult.error}`);
+                return { error: taskResult.error || 'Video generation failed', status: taskResult.status, chatId, task_id: taskId };
+            }
 
             pagePool.releasePage(page);
             page = null;
 
-            if (taskResult.success && taskResult.status === 'completed') {
-                logInfo('Видео успешно сгенерировано');
-                const videoUrl = extractVideoUrl(taskResult.data);
+            if (response.success) {
+                logRaw(JSON.stringify(response.data));
+                logInfo('Ответ получен успешно');
+                response.data.chatId = chatId;
+                response.data.parentId = response.data.response_id;
+                response.data.id = response.data.id || 'chatcmpl-' + Date.now();
+
+                const message = response.data.choices?.[0]?.message;
+                const content = message?.content || '';
+
+                // Check for tool calls
+                let toolCalls = null;
+                if (hasTools && content) {
+                    toolCalls = parseToolCallFromText(content);
+                }
+
+                if (!toolCalls || toolCalls.length === 0) {
+                    // No tool calls — final response
+                    // Flush buffered chunks if we were buffering
+                    if (hasTools && bufferedChunks.length > 0 && typeof onChunk === 'function') {
+                        for (const chunk of bufferedChunks) onChunk(chunk);
+                    }
+                    if (typeof onChunk === 'function' && content && !response.hasStreamedChunks) {
+                        onChunk(content);
+                    }
+                    return response.data;
+                }
+
+                // We have tool calls — execute them
+                logInfo(`Model requested ${toolCalls.length} tool call(s)`);
+                logInfo(`Tool calls: ${JSON.stringify(toolCalls)}`);
+
+                // Discard buffered chunks (raw JSON, not useful)
+                bufferedChunks.length = 0;
+
+                const toolResults = [];
+                for (const tc of toolCalls) {
+                    const toolName = tc.name;
+                    const toolArgs = tc.arguments || {};
+
+                    logInfo(`Executing: ${toolName}(${JSON.stringify(toolArgs)})`);
+                    const result = await executeTool(toolName, toolArgs, clientWorkdir);
+
+                    if (result.success) {
+                        toolResults.push(`## Result of ${toolName}:\n${result.output || '(no output)'}`);
+                        logInfo(`Tool ${toolName} OK, output length: ${(result.output || '').length}`);
+                    } else {
+                        toolResults.push(`## Result of ${toolName}:\nError: ${result.error || 'Unknown error'}`);
+                        logError(`Tool ${toolName} failed: ${result.error}`);
+                    }
+                }
+
+                const toolResultsText = toolResults.join('\n\n---\n\n');
+                logInfo(`Tool results ready. Returning directly.`);
+
+                // Qwen API v2 doesn't support multi-turn with tool results.
+                // Return tool output directly to client.
                 return {
-                    id: taskId,
+                    id: response.data.id || 'chatcmpl-' + Date.now(),
                     object: 'chat.completion',
                     created: Math.floor(Date.now() / 1000),
                     model,
                     choices: [{
                         index: 0,
-                        message: { role: 'assistant', content: videoUrl || JSON.stringify(taskResult.data) },
-                        finish_reason: 'stop'
+                        message: { role: 'assistant', content: toolResultsText },
+                        finish_reason: 'tool_calls'
                     }],
-                    usage: taskResult.data.usage || { prompt_tokens: 0, output_tokens: 0, total_tokens: 0 },
-                    response_id: taskId,
+                    usage: response.data.usage || { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
                     chatId,
-                    parentId: taskId,
-                    task_id: taskId,
-                    video_url: videoUrl
+                    parentId: response.data.response_id || response.data.parentId,
+                    tool_calls: toolCalls
                 };
             }
 
-            logError(`Не удалось получить видео: ${taskResult.error}`);
-            return { error: taskResult.error || 'Video generation failed', status: taskResult.status, chatId, task_id: taskId };
-        }
-
-        pagePool.releasePage(page);
-        page = null;
-
-        if (response.success) {
-            logRaw(JSON.stringify(response.data));
-            logInfo('Ответ получен успешно');
-            response.data.chatId = chatId;
-            response.data.parentId = response.data.response_id;
-            response.data.id = response.data.id || 'chatcmpl-' + Date.now();
-            
-            // Fallback: если поток чанков не был отдан, отправляем контент единым куском.
-            if (typeof onChunk === 'function' && response.data.choices?.[0]?.message?.content && !response.hasStreamedChunks) {
-                onChunk(response.data.choices[0].message.content);
+            return handleApiError(response, tokenObj, message, model, chatId, currentParentId, files, retryCount, chatType, size, waitForCompletion, onChunk);
+        } catch (error) {
+            logError('Ошибка при отправке сообщения', error);
+            return { error: error.toString(), chatId };
+        } finally {
+            if (page) {
+                pagePool.releasePage(page);
             }
-            
-            return response.data;
-        }
-
-        return handleApiError(response, tokenObj, message, model, chatId, parentId, files, retryCount, chatType, size, waitForCompletion, onChunk);
-    } catch (error) {
-        logError('Ошибка при отправке сообщения', error);
-        return { error: error.toString(), chatId };
-    } finally {
-        if (page) {
-            pagePool.releasePage(page);
         }
     }
 }

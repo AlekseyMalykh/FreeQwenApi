@@ -10,6 +10,8 @@ Cистема для создания и эмуляции активных фо�
 - **🎨 Генерация изображений**: Поддержка Qwen Image API через DALL-E-совместимый интерфейс
 - **💾 Автосохранение сессий**: Умное управление контекстом для OpenWebUI
 
+> ⚠️ **Experimental feature: tool execution is stateless and may produce inconsistent results.**
+
 **Что можно делать:**
 
 - Отправлять запросы к 18 моделям Qwen (включая qwen3-max, qwen3-coder-plus, qwq-32b и др.)
