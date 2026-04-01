@@ -81,6 +81,18 @@ export const TOOL_DEFINITIONS = {
             },
             required: ['pattern']
         }
+    },
+    apply_patch: {
+        name: 'apply_patch',
+        description: 'Apply a unified diff patch to a file. Use this instead of write_file for code changes.',
+        parameters: {
+            type: 'object',
+            properties: {
+                path: { type: 'string', description: 'Absolute path to the file to patch' },
+                patch: { type: 'string', description: 'Unified diff content (--- a/file ... +++ b/file ...)' }
+            },
+            required: ['path', 'patch']
+        }
     }
 };
 
@@ -100,6 +112,115 @@ const ARG_NAME_ALIASES = {
 };
 
 const ARG_NAMES_TO_STRIP = ['description', 'tool_call_id'];
+
+/**
+ * Apply a unified diff patch to original content.
+ * Handles standard unified diff format:
+ * --- a/file
+ * +++ b/file
+ * @@ -start,count +start,count @@
+ *  context
+ * -removed
+ * +added
+ */
+function applyUnifiedDiff(original, patch) {
+    const lines = patch.split('\n');
+    const originalLines = original.split('\n');
+    const resultLines = [];
+    
+    let hunks = [];
+    let currentHunk = null;
+    
+    // Parse hunks
+    for (const line of lines) {
+        if (line.startsWith('@@')) {
+            if (currentHunk) hunks.push(currentHunk);
+            const match = line.match(/^@@\s*-(\d+)(?:,(\d+))?\s*\+(\d+)(?:,(\d+))?\s*@@/);
+            if (!match) return { success: false, error: `Invalid hunk header: ${line}` };
+            currentHunk = {
+                origStart: parseInt(match[1]) - 1, // 0-indexed
+                origCount: parseInt(match[2]) || 1,
+                newStart: parseInt(match[3]) - 1,
+                newCount: parseInt(match[4]) || 1,
+                lines: []
+            };
+        } else if (currentHunk && (line.startsWith(' ') || line.startsWith('-') || line.startsWith('+'))) {
+            currentHunk.lines.push(line);
+        }
+    }
+    if (currentHunk) hunks.push(currentHunk);
+    
+    if (hunks.length === 0) return { success: false, error: 'No valid hunks found in patch' };
+    
+    // Apply hunks in reverse order to avoid offset issues
+    let content = originalLines;
+    for (let i = hunks.length - 1; i >= 0; i--) {
+        const hunk = hunks[i];
+        const origStart = hunk.origStart;
+        
+        // Verify context matches
+        let matchOffset = 0;
+        let found = false;
+        
+        // Try exact position first, then search nearby
+        for (let offset = 0; offset <= 10; offset++) {
+            for (const dir of [0, offset, -offset]) {
+                if (dir === 0 && offset > 0) continue;
+                const pos = origStart + dir;
+                if (pos < 0 || pos > content.length) continue;
+                
+                if (hunkMatchesAt(hunk, content, pos)) {
+                    matchOffset = dir;
+                    found = true;
+                    break;
+                }
+            }
+            if (found) break;
+        }
+        
+        if (!found) {
+            return { success: false, error: `Hunk failed at line ${origStart + 1}: context does not match` };
+        }
+        
+        const pos = origStart + matchOffset;
+        const newLines = [];
+        for (const hLine of hunk.lines) {
+            if (hLine.startsWith('-') || hLine.startsWith(' ')) {
+                // skip original
+            }
+            if (hLine.startsWith('+') || hLine.startsWith(' ')) {
+                newLines.push(hLine.startsWith('+') ? hLine.substring(1) : hLine.substring(1));
+            }
+        }
+        
+        // Calculate how many original lines to remove
+        let removeCount = 0;
+        for (const hLine of hunk.lines) {
+            if (hLine.startsWith('-') || hLine.startsWith(' ')) removeCount++;
+        }
+        
+        content.splice(pos, removeCount, ...newLines);
+    }
+    
+    const addedLines = hunks.reduce((sum, h) => sum + h.lines.filter(l => l.startsWith('+')).length, 0);
+    const removedLines = hunks.reduce((sum, h) => sum + h.lines.filter(l => l.startsWith('-')).length, 0);
+    
+    return {
+        success: true,
+        content: content.join('\n'),
+        summary: `+${addedLines} -${removedLines} (${hunks.length} hunk${hunks.length > 1 ? 's' : ''})`
+    };
+}
+
+function hunkMatchesAt(hunk, content, pos) {
+    const contextLines = hunk.lines.filter(l => l.startsWith('-') || l.startsWith(' '));
+    for (let i = 0; i < contextLines.length; i++) {
+        const expected = contextLines[i].substring(1); // remove - or + prefix
+        const actual = content[pos + i];
+        if (actual !== expected) return false;
+    }
+    return true;
+}
 
 function normalizeToolCall(toolName, args) {
     const normalizedName = TOOL_NAME_ALIASES[toolName] || toolName;
@@ -185,6 +306,18 @@ ARG command: mkdir test
 ARG workdir: C:/Projects/app
 END_TOOL
 
+User: "добавь console.log в main.js"
+You:
+TOOL_CALL: apply_patch
+ARG path: C:/Projects/app/main.js
+ARG patch: --- a/main.js
++++ b/main.js
+@@ -1,3 +1,4 @@
+ console.log('start')
++console.log('added')
+ console.log('end')
+END_TOOL
+
 Available tools:
 ${toolList}`;
 }
@@ -244,7 +377,7 @@ export async function executeTool(toolName, args, clientWorkdir = null) {
     
     // Safety: sandbox file tools to project root
     const projectRoot = clientWorkdir ? path.resolve(clientWorkdir) : PROJECT_ROOT;
-    const fileTools = ['read_file', 'write_file', 'edit_file'];
+    const fileTools = ['read_file', 'write_file', 'edit_file', 'apply_patch'];
     if (fileTools.includes(normalized.name) && normalized.arguments.path) {
         const resolvedPath = path.resolve(normalized.arguments.path);
         if (!resolvedPath.startsWith(projectRoot)) {
@@ -298,6 +431,25 @@ const TOOL_EXECUTORS = {
         if (!content.includes(old_string)) return { success: false, error: `String not found in file` };
         fs.writeFileSync(resolved, content.replace(old_string, new_string), 'utf-8');
         return { success: true, output: `Edited ${filePath}` };
+    },
+
+    async apply_patch({ path: filePath, patch }) {
+        const resolved = path.resolve(filePath);
+        if (!fs.existsSync(resolved)) return { success: false, error: `File not found: ${filePath}` };
+        
+        try {
+            // Parse unified diff and apply it
+            const original = fs.readFileSync(resolved, 'utf-8');
+            const result = applyUnifiedDiff(original, patch);
+            
+            if (result.success) {
+                fs.writeFileSync(resolved, result.content, 'utf-8');
+                return { success: true, output: `Patch applied to ${filePath}\n${result.summary}` };
+            }
+            return { success: false, error: result.error };
+        } catch (e) {
+            return { success: false, error: `Patch failed: ${e.message}` };
+        }
     },
 
     async bash({ command, workdir }) {
