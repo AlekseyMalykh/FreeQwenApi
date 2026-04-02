@@ -798,21 +798,21 @@ router.post('/chat/completions', async (req, res) => {
         const { combinedTools } = buildCombinedTools(tools, functions, tool_choice);
         const sessionKey = resolveSessionKey(req.headers, req.body);
 
-        // Extract last user message for multi-turn path guidance
-        let lastUserMessage = null;
+        // Extract last user message text for multi-turn path guidance
+        let lastUserMessageText = null;
         if (messages && messages.length > 0) {
             for (let i = messages.length - 1; i >= 0; i--) {
                 if (messages[i].role === 'user') {
-                    lastUserMessage = typeof messages[i].content === 'string'
+                    lastUserMessageText = typeof messages[i].content === 'string'
                         ? messages[i].content
                         : JSON.stringify(messages[i].content);
                     break;
                 }
             }
         }
-        if (!lastUserMessage && messages?.length) {
+        if (!lastUserMessageText && messages?.length) {
             const fallback = messages[messages.length - 1]?.content;
-            lastUserMessage = typeof fallback === 'string' ? fallback : JSON.stringify(fallback);
+            lastUserMessageText = typeof fallback === 'string' ? fallback : JSON.stringify(fallback);
         }
 
         // Логируем полную историю сообщений
