@@ -369,7 +369,9 @@ async function handleStreamingResponse(res, mappedModel, messageContent, chatId,
     });
 
     try {
-        const result = await sendMessage(messageContent, mappedModel, chatId, parentId, null, combinedTools, toolChoice, systemMessage, 't2t', null, true, 0, null, clientWorkdir);
+        const clientWorkdir = req.headers['x-working-directory'] || req.headers['x-workdir'] || null;
+        const sessionKey = resolveSessionKey(req.headers, req.body);
+        const result = await sendMessage(messageContent, mappedModel, chatId, parentId, null, combinedTools, toolChoice, systemMessage, 't2t', null, true, 0, null, clientWorkdir, sessionKey);
 
         if (result.error) {
             writeSse({
@@ -519,7 +521,8 @@ router.post('/chat', async (req, res) => {
                     true,
                     0,
                     streamingCallback,
-                    clientWorkdir
+                    clientWorkdir,
+                    sessionKey
                 );
 
                 if (result.error) {
@@ -574,7 +577,7 @@ router.post('/chat', async (req, res) => {
             }
         }
 
-            const result = await sendMessage(messageContent, mappedModel, isMeta ? null : chatId, isMeta ? null : parentId, null, null, null, systemMessage, 't2t', null, true, 0, null, clientWorkdir);
+            const result = await sendMessage(messageContent, mappedModel, isMeta ? null : chatId, isMeta ? null : parentId, null, null, null, systemMessage, 't2t', null, true, 0, null, clientWorkdir, sessionKey);
 
         if (result.choices && result.choices[0] && result.choices[0].message) {
             const responseLength = result.choices[0].message.content ? result.choices[0].message.content.length : 0;
@@ -854,7 +857,8 @@ router.post('/chat/completions', async (req, res) => {
                     true,
                     0,
                     streamingCallback,
-                    clientWorkdir
+                    clientWorkdir,
+                    sessionKey
                 );
 
                 // Сохраняем chatId в сессию для следующих запросов
@@ -919,9 +923,10 @@ router.post('/chat/completions', async (req, res) => {
             }
         } else {
             const clientWorkdir = req.headers['x-working-directory'] || req.headers['x-workdir'] || null;
+            const sessionKey = resolveSessionKey(req.headers, req.body);
             const combinedTools = tools || (functions ? functions.map(fn => ({ type: 'function', function: fn })) : null);
             const qwenChatId = await resolveQwenChatId(effectiveChatId, mappedModel);
-            const result = await sendMessage(messageContent, mappedModel, qwenChatId, effectiveParentId, null, combinedTools, tool_choice, systemMessage, 't2t', null, true, 0, null, clientWorkdir);
+            const result = await sendMessage(messageContent, mappedModel, qwenChatId, effectiveParentId, null, combinedTools, tool_choice, systemMessage, 't2t', null, true, 0, null, clientWorkdir, sessionKey);
 
             // Сохраняем chatId в сессию для следующих запросов
             if (!isMeta && result.chatId) {
@@ -1153,7 +1158,8 @@ router.post('/v1/chat/completions', async (req, res) => {
                     true,
                     0,
                     streamingCallback,
-                    clientWorkdir
+                    clientWorkdir,
+                    sessionKey
                 );
 
                 // Сохраняем chatId в сессию для следующих запросов
@@ -1212,11 +1218,12 @@ router.post('/v1/chat/completions', async (req, res) => {
                 res.end();
             }
         } else {
-            const combinedTools = tools || (functions ? functions.map(fn => ({ type: 'function', function: fn })) : null);
-            const qwenChatId = await resolveQwenChatId(effectiveChatId, mappedModel);
-            const clientWorkdir = req.headers['x-working-directory'] || req.headers['x-workdir'] || null;
+                const combinedTools = tools || (functions ? functions.map(fn => ({ type: 'function', function: fn })) : null);
+                const qwenChatId = await resolveQwenChatId(effectiveChatId, mappedModel);
+                const clientWorkdir = req.headers['x-working-directory'] || req.headers['x-workdir'] || null;
+                const sessionKey = resolveSessionKey(req.headers, req.body);
 
-            const result = await sendMessage(messageContent, mappedModel, qwenChatId, effectiveParentId, files, combinedTools, tool_choice, systemMessage, 't2t', null, true, 0, null, clientWorkdir);
+            const result = await sendMessage(messageContent, mappedModel, qwenChatId, effectiveParentId, files, combinedTools, tool_choice, systemMessage, 't2t', null, true, 0, null, clientWorkdir, sessionKey);
 
             // Сохраняем chatId в сессии для следующих запросов
             if (!isMeta && result.chatId) {
@@ -1650,7 +1657,7 @@ router.post('/agent/state/patch/confirm', async (req, res) => {
 /**
  * POST /api/agent/state/patch/reject - Reject a pending patch
  */
-router.post('/api/agent/state/patch/reject', async (req, res) => {
+router.post('/agent/state/patch/reject', async (req, res) => {
     try {
         const sessionKey = req.query.session_key || req.headers['x-session-key'] || req.query.conversation_id || req.headers['x-conversation-id'];
         if (!sessionKey) return res.status(400).json({ error: 'Missing session_key' });

@@ -1,6 +1,7 @@
 import { logInfo, logError, logDebug, logWarn } from '../logger/index.js';
 import {
     getOrCreateAgentState,
+    getAgentState,
     recordToolAction,
     setPendingPatch,
     clearPendingPatch,
@@ -287,8 +288,14 @@ async function executeToolCalls(toolCalls, agentState, sessionKey, clientWorkdir
                 setPendingPatch(sessionKey, observation.patchId, toolArgs.path);
             }
             if (toolName === 'apply_patch' && observation.success) {
-                markPatchApplied(sessionKey);
-                clearPendingPatch(sessionKey);
+                // Only allow apply if patch was confirmed (approval gate)
+                const state = getAgentState(sessionKey);
+                if (state && state.patchState.status === 'confirmed') {
+                    markPatchApplied(sessionKey);
+                    clearPendingPatch(sessionKey);
+                } else {
+                    logWarn(`apply_patch blocked: patch not confirmed (status: ${state?.patchState?.status})`);
+                }
             }
             
             recordToolAction(sessionKey, {

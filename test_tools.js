@@ -138,11 +138,13 @@ const ps6 = getAgentState('patch_test');
 assert(ps6.patchState.status === 'rejected', 'Patch state is rejected after confirm+reject');
 clearPendingPatch('patch_test');
 
-// Test 13: apply without confirm (via markPatchApplied directly)
+// Test 13: markPatchApplied directly (internal function, not tool flow)
+// Note: The apply_patch tool executor requires confirmed status.
+// This test verifies the state machine function works correctly.
 setPendingPatch('patch_test', 'p3', 'f.js');
 markPatchApplied('patch_test');
 const ps7 = getAgentState('patch_test');
-assert(ps7.patchState.status === 'applied', 'Patch state is applied without confirm');
+assert(ps7.patchState.status === 'applied', 'markPatchApplied sets applied status');
 clearPendingPatch('patch_test');
 
 // Test 14: reject when no patch

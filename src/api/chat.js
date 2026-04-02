@@ -781,7 +781,7 @@ async function handleApiError(response, tokenObj, message, model, chatId, parent
 
 // ─── Main public API ─────────────────────────────────────────────────────────
 
-export async function sendMessage(message, model = DEFAULT_MODEL, chatId = null, parentId = null, files = null, tools = null, toolChoice = null, systemMessage = null, chatType = 't2t', size = null, waitForCompletion = true, retryCount = 0, onChunk = null, clientWorkdir = null) {
+export async function sendMessage(message, model = DEFAULT_MODEL, chatId = null, parentId = null, files = null, tools = null, toolChoice = null, systemMessage = null, chatType = 't2t', size = null, waitForCompletion = true, retryCount = 0, onChunk = null, clientWorkdir = null, sessionKey = null) {
     if (!availableModels) availableModels = getAvailableModelsFromFile();
 
     if (!chatId) {
@@ -818,7 +818,10 @@ export async function sendMessage(message, model = DEFAULT_MODEL, chatId = null,
 
     // Get or create agent state for this session
     // sessionKey is separate from chatId (upstream Qwen conversation id)
-    const sessionKey = chatId ? `chat_${chatId}` : `session_${crypto.randomUUID().substring(0, 12)}`;
+    // If no sessionKey provided, derive from chatId or generate new
+    if (!sessionKey) {
+        sessionKey = chatId ? `chat_${chatId}` : `session_${crypto.randomUUID().substring(0, 12)}`;
+    }
     const projectRoot = clientWorkdir || process.cwd();
     const agentState = getOrCreateAgentState({
         sessionKey,

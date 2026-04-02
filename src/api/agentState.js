@@ -166,6 +166,8 @@ export function confirmPendingPatch(sessionKey) {
     if (!state || state.patchState.status !== 'pending') return false;
     state.patchState.status = 'confirmed';
     state.patchState.confirmedAt = Date.now();
+    // Transition: approval granted → agent can proceed to apply
+    state.taskStatus = 'planning';
     state.updatedAt = Date.now();
     return true;
 }
