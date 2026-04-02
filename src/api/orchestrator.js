@@ -18,15 +18,11 @@ import {
     addObservation,
     autoTransitionMode
 } from './agentState.js';
-import { executeTool, parseToolCallFromText } from '../tools/toolExecutor.js';
+import { executeTool, parseToolCallFromText, TOOL_DEFINITIONS } from '../tools/toolExecutor.js';
 import { buildToolObservation, hasProgress } from './toolObservation.js';
-import { AGENT_NO_PROGRESS_LIMIT } from '../config.js';
+import { AGENT_NO_PROGRESS_LIMIT, ENABLE_BASH_TOOL } from '../config.js';
 
 const DEFAULT_MAX_STEPS = 5;
-
-function escapeRegExp(value) {
-    return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-}
 
 function joinPath(base, name) {
     if (!base) return name;
@@ -148,7 +144,13 @@ function buildDirectPathGuidance(message, agentState) {
         return `\nDIRECT INSTRUCTION: The user referred to a file in the current working directory.\nUse read_file with path: ${inferred.path}. Do NOT search or glob first.`;
     }
     
-    return `\nDIRECT INSTRUCTION: The user specified directory: ${pathInfo.path}\nUse bash with 'ls' or glob to list contents of this directory.`;
+    // Directory path — suggest appropriate tools based on capabilities
+    const bashAvailable = ENABLE_BASH_TOOL;
+    if (bashAvailable) {
+        return `\nDIRECT INSTRUCTION: The user specified directory: ${pathInfo.path}\nUse bash with 'ls' or glob to list contents of this directory.`;
+    } else {
+        return `\nDIRECT INSTRUCTION: The user specified directory: ${pathInfo.path}\nNote: bash tool is disabled in this environment. Use glob to find files instead.`;
+    }
 }
 
 /**
@@ -191,6 +193,16 @@ function buildNextMessage(toolCalls, observations, state, step, userMessage) {
     // Direct path guidance (highest priority)
     const directPathGuidance = userMessage ? buildDirectPathGuidance(userMessage, state) : '';
     
+    // File context guidance — if user asks about "it" or "the file"
+    let fileContextGuidance = '';
+    if (state?.lastReadFile && userMessage) {
+        const vagueRefs = ['в нем', 'в нём', 'его содержимое', 'что в нем', 'what is in it', 'show me the content', 'its content', 'the file'];
+        const hasVagueRef = vagueRefs.some(ref => userMessage.toLowerCase().includes(ref));
+        if (hasVagueRef) {
+            fileContextGuidance = `\nFILE CONTEXT: The user is asking about the last read file: ${state.lastReadFile}\nYou already have the content. Do NOT call read_file, ls, or glob. Answer using the content you already received.`;
+        }
+    }
+    
     const guidance = `\nDecide the single best next step.
 You may:
 - explore more files (glob, grep)
@@ -202,7 +214,7 @@ Do not repeat a previous action unless it is necessary.
 Prefer propose_patch instead of write_file for code changes.
 If the user gave an explicit file path, use read_file directly with that path.`;
     
-    return `${directPathGuidance}${goalBlock}${modeBlock}${progressBlock}${obsBlock}${guidance}`;
+    return `${directPathGuidance}${fileContextGuidance}${goalBlock}${modeBlock}${progressBlock}${obsBlock}${guidance}`;
 }
 
 /**
@@ -241,6 +253,7 @@ export async function runAgentLoop(sendToModel, options = {}) {
     logInfo(`Agent loop started for session: ${sessionKey}, maxSteps: ${maxSteps}, mode: ${agentState.mode}`);
     
     let currentMessage = options.initialMessage;
+    let lastUserMessage = options.initialMessage; // Track latest user message for path guidance
     let allToolCalls = [];
     let allObservations = [];
     let lastResponse = null;
@@ -302,10 +315,44 @@ export async function runAgentLoop(sendToModel, options = {}) {
         
         // Execute tool calls
         logInfo(`Executing ${toolCalls.length} tool call(s) at step ${step + 1}`);
-        const { observations } = await executeToolCalls(toolCalls, agentState, sessionKey, clientWorkdir);
+        const { observations, blockedTools } = await executeToolCalls(toolCalls, agentState, sessionKey, clientWorkdir);
         
         allToolCalls.push(...toolCalls);
         allObservations.push(...observations);
+        
+        // Gate: if a critical tool was blocked (e.g., bash disabled), stop immediately
+        if (blockedTools.length > 0) {
+            const blockedNames = blockedTools.map(t => t.name).join(', ');
+            logWarn(`Blocked tools detected: ${blockedNames}. Stopping loop.`);
+            stopped = true;
+            stopReason = `Tools unavailable: ${blockedNames}`;
+            
+            // Build a clear response for the user about what's blocked
+            const blockedMsg = blockedTools.map(t => {
+                if (t.name === 'bash') return `bash tool is disabled (set ENABLE_BASH_TOOL=1 to enable).`;
+                return `${t.name} tool is not available.`;
+            }).join(' ');
+            
+            // Return the blocked tool info directly
+            return {
+                success: true,
+                stopped: true,
+                stopReason,
+                steps: allToolCalls.length,
+                toolCalls: allToolCalls,
+                observations: allObservations,
+                lastResponse: {
+                    choices: [{
+                        message: {
+                            role: 'assistant',
+                            content: `Cannot complete this request. ${blockedMsg}`
+                        },
+                        finish_reason: 'blocked_tool'
+                    }]
+                },
+                agent: buildAgentMetadata(agentState, stopReason)
+            };
+        }
         
         // Check for progress
         let hadProgress = false;
@@ -351,8 +398,8 @@ export async function runAgentLoop(sendToModel, options = {}) {
             });
         }
         
-        // Build next message (pass original user message for direct path detection)
-        currentMessage = buildNextMessage(toolCalls, observations, agentState, step, options.initialMessage);
+        // Build next message (pass latest user message for direct path detection)
+        currentMessage = buildNextMessage(toolCalls, observations, agentState, step, lastUserMessage);
     }
     
     // If we exited the loop without stopping, it means max steps reached
@@ -380,6 +427,7 @@ export async function runAgentLoop(sendToModel, options = {}) {
  */
 async function executeToolCalls(toolCalls, agentState, sessionKey, clientWorkdir) {
     const observations = [];
+    const blockedTools = [];
     
     for (const tc of toolCalls) {
         const toolName = tc.name;
@@ -387,6 +435,11 @@ async function executeToolCalls(toolCalls, agentState, sessionKey, clientWorkdir
         
         logInfo(`Executing: ${toolName}(${JSON.stringify(toolArgs)})`);
         const result = await executeTool(toolName, toolArgs, clientWorkdir);
+        
+        // Track blocked tools for immediate loop termination
+        if (!result.success && result.error?.includes('disabled')) {
+            blockedTools.push({ name: toolName, error: result.error });
+        }
         
         // Build structured observation
         const observation = buildToolObservation(toolName, toolArgs, result);
@@ -396,8 +449,16 @@ async function executeToolCalls(toolCalls, agentState, sessionKey, clientWorkdir
         if (agentState) {
             if (toolArgs.workdir) updateCwd(sessionKey, toolArgs.workdir);
             
-            if (['read_file', 'write_file', 'edit_file', 'apply_patch', 'propose_patch'].includes(toolName) && toolArgs.path) {
-                touchRecentFile(sessionKey, toolArgs.path);
+            if (toolName === 'read_file' && toolArgs.path && result.success) {
+                // Store file context for follow-up questions
+                agentState.lastReadFile = toolArgs.path;
+                agentState.lastReadContent = observation.content?.substring(0, 2000) || null;
+            }
+            
+            // Detect repeated read of same file
+            if (toolName === 'read_file' && toolArgs.path && agentState.lastReadFile === toolArgs.path) {
+                incrementNoProgress(sessionKey);
+                logWarn(`Repeated read of same file: ${toolArgs.path}`);
             }
             
             if (toolName === 'glob' && toolArgs.pattern) {
@@ -419,7 +480,6 @@ async function executeToolCalls(toolCalls, agentState, sessionKey, clientWorkdir
                 setPendingPatch(sessionKey, observation.patchId, toolArgs.path);
             }
             if (toolName === 'apply_patch' && observation.success) {
-                // Only allow apply if patch was confirmed (approval gate)
                 const state = getAgentState(sessionKey);
                 if (state && state.patchState.status === 'confirmed') {
                     markPatchApplied(sessionKey);
@@ -440,7 +500,7 @@ async function executeToolCalls(toolCalls, agentState, sessionKey, clientWorkdir
         }
     }
     
-    return { observations };
+    return { observations, blockedTools };
 }
 
 /**

@@ -64,6 +64,10 @@ export function createAgentState({ sessionKey, scope, projectRoot, cwd, taskGoal
         actionHistory: [],
         lastToolResultSummary: null,
         
+        // File context memory — agent remembers last read file and its content
+        lastReadFile: null,
+        lastReadContent: null,
+        
         // Phase 6: goal-aware runtime
         taskGoal: taskGoal || null,
         taskStatus: 'exploring', // exploring | planning | awaiting_approval | done
@@ -302,6 +306,11 @@ export function buildAgentRuntimeContext(state) {
         const ps = state.patchState;
         const patchInfo = `PATCH: ${ps.status} (${ps.id?.substring(0, 12) || 'unknown'}) for ${ps.file || 'unknown'}`;
         parts.push(patchInfo);
+    }
+    
+    // Priority 3b: Last read file (critical for follow-up questions)
+    if (state.lastReadFile) {
+        parts.push(`LAST FILE READ: ${state.lastReadFile}`);
     }
     
     // Priority 4: Progress summary (concise)

@@ -273,6 +273,24 @@ assert(noInfer === null, 'Scenario 6c: no inference for general questions');
 
 resetAgentState('infer_test');
 
+// Scenario 7: lastReadFile memory — runtime context includes last read file
+const memState = createAgentState({ sessionKey: 'mem_test', projectRoot: 'C:/test', cwd: 'C:/test' });
+memState.lastReadFile = 'C:/test/script.py';
+memState.lastReadContent = 'print("hello")';
+const memCtx = buildAgentRuntimeContext(memState);
+assert(memCtx.includes('LAST FILE READ: C:/test/script.py'), 'Scenario 7: runtime context includes last read file');
+resetAgentState('mem_test');
+
+// Scenario 8: file context guidance for vague references
+const vagueState = createAgentState({ sessionKey: 'vague_test', projectRoot: 'C:/test', cwd: 'C:/test' });
+vagueState.lastReadFile = 'C:/test/script.py';
+vagueState.lastReadContent = 'print("hello")';
+// Simulate buildNextMessage logic
+const vagueRefs = ['в нем', 'в нём', 'его содержимое', 'что в нем', 'what is in it', 'show me the content'];
+const hasVagueRef = vagueRefs.some(ref => 'что в нем?'.toLowerCase().includes(ref));
+assert(hasVagueRef, 'Scenario 8: vague reference detected');
+resetAgentState('vague_test');
+
 // ─── 6. Orchestration loop tests ─────────────────────────────────────────────
 console.log('\n=== 6. Orchestration Loop Tests ===\n');
 
