@@ -1630,9 +1630,17 @@ router.post('/agent/state/patch/confirm', async (req, res) => {
         if (!sessionKey) return res.status(400).json({ error: 'Missing session_key' });
         
         const result = confirmSessionPatch(sessionKey);
-        if (!result) return res.status(400).json({ error: 'No pending patch or already confirmed' });
+        if (!result) return res.status(400).json({ error: 'No pending patch or already confirmed/rejected' });
+        
+        const state = getAgentState(sessionKey);
         logInfo(`Patch confirmed for session: ${sessionKey}`);
-        res.json({ success: true, message: 'Patch confirmed' });
+        res.json({
+            success: true,
+            message: 'Patch confirmed',
+            patchState: state?.patchState,
+            taskStatus: state?.taskStatus,
+            mode: state?.mode
+        });
     } catch (error) {
         logError('Error confirming patch', error);
         res.status(500).json({ error: 'Internal server error' });
@@ -1642,14 +1650,23 @@ router.post('/agent/state/patch/confirm', async (req, res) => {
 /**
  * POST /api/agent/state/patch/reject - Reject a pending patch
  */
-router.post('/agent/state/patch/reject', async (req, res) => {
+router.post('/api/agent/state/patch/reject', async (req, res) => {
     try {
         const sessionKey = req.query.session_key || req.headers['x-session-key'] || req.query.conversation_id || req.headers['x-conversation-id'];
         if (!sessionKey) return res.status(400).json({ error: 'Missing session_key' });
         
-        rejectPendingPatch(sessionKey);
+        const result = rejectPendingPatch(sessionKey);
+        if (!result) return res.status(400).json({ error: 'No patch to reject or already rejected' });
+        
+        const state = getAgentState(sessionKey);
         logInfo(`Patch rejected for session: ${sessionKey}`);
-        res.json({ success: true, message: 'Patch rejected' });
+        res.json({
+            success: true,
+            message: 'Patch rejected',
+            patchState: state?.patchState,
+            taskStatus: state?.taskStatus,
+            mode: state?.mode
+        });
     } catch (error) {
         logError('Error rejecting patch', error);
         res.status(500).json({ error: 'Internal server error' });

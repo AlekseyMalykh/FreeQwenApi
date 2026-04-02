@@ -68,6 +68,20 @@ assert(stateA.projectRoot !== stateB.projectRoot, 'Sessions are isolated');
 resetAgentState('iso_a');
 resetAgentState('iso_b');
 
+// Test 6: resolveSessionKey with empty/whitespace header
+const keyEmpty = resolveSessionKey({ 'x-session-key': '  ' }, {});
+assert(keyEmpty.startsWith('session_'), 'Empty session key generates new one');
+
+// Test 7: resolveSessionKey with both header and conversation_id
+const keyBoth = resolveSessionKey({ 'x-session-key': 'explicit-key' }, { conversation_id: 'conv_123' });
+assert(keyBoth === 'explicit-key', 'x-session-key takes priority over conversation_id');
+
+// Test 8: reset + reuse session
+resetAgentState('test_sid');
+const reused = getOrCreateAgentState({ sessionKey: 'test_sid', projectRoot: 'C:/new' });
+assert(reused.projectRoot === 'C:/new', 'Session can be recreated after reset');
+resetAgentState('test_sid');
+
 // ─── 2. Patch lifecycle tests ────────────────────────────────────────────────
 console.log('\n=== 2. Patch Lifecycle Tests ===\n');
 
@@ -107,6 +121,42 @@ assert(ps4.patchState.status === 'applied', 'Patch state is applied');
 clearPendingPatch('patch_test');
 const ps5 = getAgentState('patch_test');
 assert(ps5.patchState.status === 'none', 'Patch state cleared to none');
+
+// Test 11: double confirm should fail
+setPendingPatch('patch_test', 'p1', 'f.js');
+confirmPendingPatch('patch_test');
+const doubleConfirm = confirmPendingPatch('patch_test');
+assert(!doubleConfirm, 'Double confirm returns false');
+clearPendingPatch('patch_test');
+
+// Test 12: reject after confirm should work
+setPendingPatch('patch_test', 'p2', 'f.js');
+confirmPendingPatch('patch_test');
+const rejectAfterConfirm = rejectPendingPatch('patch_test');
+assert(rejectAfterConfirm, 'Reject after confirm returns true');
+const ps6 = getAgentState('patch_test');
+assert(ps6.patchState.status === 'rejected', 'Patch state is rejected after confirm+reject');
+clearPendingPatch('patch_test');
+
+// Test 13: apply without confirm (via markPatchApplied directly)
+setPendingPatch('patch_test', 'p3', 'f.js');
+markPatchApplied('patch_test');
+const ps7 = getAgentState('patch_test');
+assert(ps7.patchState.status === 'applied', 'Patch state is applied without confirm');
+clearPendingPatch('patch_test');
+
+// Test 14: reject when no patch
+const noPatchReject = rejectPendingPatch('patch_test');
+assert(!noPatchReject, 'Reject with no patch returns false');
+
+// Test 15: runtime context changes with patch state
+setPendingPatch('patch_test', 'p4', 'routes.js');
+const ctxPending = buildAgentRuntimeContext(getAgentState('patch_test'));
+assert(ctxPending.includes('PATCH: pending'), 'Context shows pending patch');
+confirmPendingPatch('patch_test');
+const ctxConfirmed = buildAgentRuntimeContext(getAgentState('patch_test'));
+assert(ctxConfirmed.includes('PATCH: confirmed'), 'Context shows confirmed patch');
+clearPendingPatch('patch_test');
 resetAgentState('patch_test');
 
 // ─── 3. Runtime context tests ────────────────────────────────────────────────
@@ -126,6 +176,19 @@ assert(ctx.includes('PATCH: pending'), 'Context includes patch state');
 assert(ctx.includes('PROGRESS:'), 'Context includes progress');
 assert(ctx.includes('C:/app'), 'Context includes project root');
 assert(ctx.length < 500, `Context is concise (${ctx.length} chars)`);
+
+// Test: runtime context stays under 500 chars even with lots of data
+const bigState = createAgentState({ sessionKey: 'big_ctx', projectRoot: 'C:/app', taskGoal: 'Fix all bugs in the entire codebase including edge cases and performance issues' });
+bigState.recentFiles = Array(20).fill(null).map((_, i) => `file_${i}.js`);
+bigState.progressSummary = Array(10).fill(null).map((_, i) => `Step ${i}: found issue ${i}`);
+bigState.lastObservations = Array(5).fill(null).map((_, i) => ({ tool: 'grep', summary: `Found ${i * 10} matches for pattern ${i} in file ${i}.js` }));
+bigState.lastSearchResults = Array(5).fill(null).map((_, i) => ({ tool: 'grep', query: `query_${i}`, resultCount: i * 10 }));
+bigState.actionHistory = Array(10).fill(null).map((_, i) => ({ tool: 'read_file', summary: `file_${i}.js`, success: true, at: Date.now() }));
+bigState.lastDecision = 'Read all files to understand the bug';
+bigState.noProgressCount = 3;
+const bigCtx = buildAgentRuntimeContext(bigState);
+assert(bigCtx.length < 500, `Context stays under 500 chars even with lots of data (${bigCtx.length} chars)`);
+resetAgentState('big_ctx');
 resetAgentState('ctx_test');
 
 // ─── 4. Structured observation tests ─────────────────────────────────────────

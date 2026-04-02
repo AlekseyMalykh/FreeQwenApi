@@ -20,14 +20,17 @@ const MAX_ACTION_HISTORY = 50;
  * NOT used as sessionKey.
  */
 export function resolveSessionKey(headers, body) {
-    // 1. Explicit session key from header
+    // 1. Explicit session key from header (highest priority)
     const headerKey = headers?.['x-session-key'] || headers?.['x-agent-session'];
-    if (headerKey) return headerKey;
+    if (headerKey && headerKey.trim()) return headerKey.trim();
     
     // 2. conversation_id from body (if it looks like a local ID, not Qwen chatId)
     const conversationId = body?.conversation_id;
-    if (conversationId && !conversationId.match(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/)) {
-        return `conv_${conversationId}`;
+    if (conversationId && typeof conversationId === 'string' && conversationId.trim()) {
+        // Don't use UUID-like Qwen chatIds as session keys
+        if (!conversationId.match(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/)) {
+            return `conv_${conversationId.trim()}`;
+        }
     }
     
     // 3. Generate new local session key
@@ -173,7 +176,9 @@ export function confirmSessionPatch(sessionKey) {
 
 export function rejectPendingPatch(sessionKey) {
     const state = sessionAgentState.get(sessionKey);
-    if (!state || state.patchState.status === 'none') return false;
+    if (!state) return false;
+    // Can only reject if pending or confirmed (not none, not already rejected)
+    if (state.patchState.status === 'none' || state.patchState.status === 'rejected') return false;
     state.patchState.status = 'rejected';
     state.patchState.rejectedAt = Date.now();
     state.mode = state.mode === 'propose' ? 'analyze' : state.mode;
@@ -276,8 +281,8 @@ export function buildAgentRuntimeContext(state) {
     if (!state) return '';
     
     const parts = [];
-    const MAX_BLOCK_LINES = 8;
     const MAX_SUMMARY_CHARS = 120;
+    const HARD_LIMIT = 500;
     
     // Priority 1: Task goal and status (always first)
     if (state.taskGoal) {
@@ -303,26 +308,26 @@ export function buildAgentRuntimeContext(state) {
         parts.push(`PROGRESS: ${recent.join(' | ').substring(0, MAX_SUMMARY_CHARS)}`);
     }
     
-    // Priority 5: Recent decisive observations
+    // Priority 5: Recent decisive observations (limited)
     if (state.lastObservations.length > 0) {
         const recent = state.lastObservations.slice(-2)
             .map(o => o.summary || o.tool || '')
             .filter(Boolean)
-            .slice(0, MAX_BLOCK_LINES);
+            .slice(0, 2);
         if (recent.length > 0) {
             parts.push(`OBSERVATIONS: ${recent.join(' | ').substring(0, MAX_SUMMARY_CHARS)}`);
         }
     }
     
-    // Priority 6: Recent files (limited)
+    // Priority 6: Recent files (limited to 3)
     if (state.recentFiles.length > 0) {
-        const files = state.recentFiles.slice(0, 5);
+        const files = state.recentFiles.slice(0, 3);
         parts.push(`FILES: ${files.join(', ')}`);
     }
     
-    // Priority 7: Recent search results (limited)
+    // Priority 7: Recent search results (limited to 1)
     if (state.lastSearchResults.length > 0) {
-        const searches = state.lastSearchResults.slice(-2)
+        const searches = state.lastSearchResults.slice(-1)
             .map(s => `${s.tool}("${s.query}")→${s.resultCount}`);
         parts.push(`SEARCHES: ${searches.join(', ')}`);
     }
@@ -337,7 +342,13 @@ export function buildAgentRuntimeContext(state) {
         parts.push(`NO PROGRESS: ${state.noProgressCount} step(s)`);
     }
     
-    return parts.join('\n');
+    let result = parts.join('\n');
+    // Hard limit: truncate if still too long
+    if (result.length > HARD_LIMIT) {
+        result = result.substring(0, HARD_LIMIT - 3) + '...';
+    }
+    
+    return result;
 }
 
 // ─── Phase 6: Goal-aware agent helpers ───────────────────────────────────────
