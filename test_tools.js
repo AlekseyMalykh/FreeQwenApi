@@ -6,6 +6,7 @@ import {
     setLastSearchResults, updateCwd, resetAgentState,
     buildAgentRuntimeContext, getAllSessionKeys, getAgentStateCount
 } from './src/api/agentState.js';
+import { runAgentLoop } from './src/api/orchestrator.js';
 import path from 'path';
 import fs from 'fs';
 
@@ -333,6 +334,98 @@ assert(count >= 2, `State count is ${count} (at least 2 sessions)`);
 resetAgentState('test_session_2');
 resetAgentState('session_a');
 resetAgentState('session_b');
+
+// ─── 11. Orchestration loop tests ────────────────────────────────────────────
+console.log('\n=== 11. Orchestration Loop Tests ===\n');
+
+// Test 1: Multi-step loop stops on propose_patch
+// Create the target file first so propose_patch succeeds
+const ORCH_FILE = path.join(TEST_DIR, 'orch_file.js');
+fs.writeFileSync(ORCH_FILE, 'old\n', 'utf-8');
+
+let step1Count = 0;
+const mockSendToModel1 = async (message) => {
+    step1Count++;
+    if (step1Count === 1) {
+        return { choices: [{ message: { content: 'TOOL_CALL: grep\nARG pattern: function\nARG path: C:/test\nEND_TOOL' } }] };
+    }
+    if (step1Count === 2) {
+        return { choices: [{ message: { content: `TOOL_CALL: propose_patch\nARG path: ${ORCH_FILE}\nARG patch: --- a/orch_file.js\n+++ b/orch_file.js\n@@ -1 +1 @@\n-old\n+new\nEND_TOOL` } }] };
+    }
+    return { choices: [{ message: { content: 'Done!' } }] };
+};
+
+const result1 = await runAgentLoop(mockSendToModel1, {
+    sessionKey: 'orch_test_1',
+    clientWorkdir: TEST_DIR,
+    maxSteps: 5,
+    initialMessage: 'Find the function and fix it'
+});
+assert(result1.success, 'Orchestrator loop succeeds');
+assert(result1.stopped && result1.stopReason.includes('Patch proposed'), 'Loop stops on propose_patch');
+assert(result1.toolCalls.length === 2, `Two tool calls executed (${result1.toolCalls.length})`);
+assert(result1.agentState?.pendingPatchId, 'Pending patch stored in state');
+
+// Test 2: Loop stops on max steps
+let step2Count = 0;
+const mockSendToModel2 = async () => {
+    step2Count++;
+    return { choices: [{ message: { content: 'TOOL_CALL: grep\nARG pattern: test\nARG path: C:/test\nEND_TOOL' } }] };
+};
+
+const result2 = await runAgentLoop(mockSendToModel2, {
+    sessionKey: 'orch_test_2',
+    clientWorkdir: 'C:/test',
+    maxSteps: 3,
+    initialMessage: 'Search for test'
+});
+assert(result2.success, 'Orchestrator loop succeeds with max steps');
+assert(result2.stopped && result2.stopReason.includes('Max steps'), `Loop stops at max steps (${result2.stopReason})`);
+assert(step2Count === 3, `Exactly 3 steps executed (${step2Count})`);
+
+// Test 3: Loop stops when model has no more tool calls
+let step3Count = 0;
+const mockSendToModel3 = async () => {
+    step3Count++;
+    if (step3Count === 1) {
+        return { choices: [{ message: { content: 'TOOL_CALL: grep\nARG pattern: test\nEND_TOOL' } }] };
+    }
+    return { choices: [{ message: { content: 'Task complete!' } }] };
+};
+
+const result3 = await runAgentLoop(mockSendToModel3, {
+    sessionKey: 'orch_test_3',
+    clientWorkdir: 'C:/test',
+    maxSteps: 5,
+    initialMessage: 'Run grep'
+});
+assert(result3.success, 'Orchestrator loop succeeds');
+assert(result3.stopped && result3.stopReason === 'Task completed', 'Loop stops when model completes task');
+assert(result3.toolCalls.length === 1, `One tool call executed (${result3.toolCalls.length})`);
+
+// Test 4: Agent state is updated during loop
+const stateAfterLoop = getAgentState('orch_test_1');
+assert(stateAfterLoop && stateAfterLoop.recentFiles.length > 0, 'Recent files tracked during loop');
+assert(stateAfterLoop && stateAfterLoop.actionHistory.length > 0, 'Action history tracked during loop');
+
+// Test 5: write_file stops the loop for safety
+const mockSendToModel5 = async () => {
+    return { choices: [{ message: { content: 'TOOL_CALL: write_file\nARG path: C:/test/file.js\nARG content: x\nEND_TOOL' } }] };
+};
+
+const result5 = await runAgentLoop(mockSendToModel5, {
+    sessionKey: 'orch_test_5',
+    clientWorkdir: 'C:/test',
+    maxSteps: 5,
+    initialMessage: 'Write a file'
+});
+assert(result5.stopped && result5.stopReason.includes('write_file'), 'Loop stops on write_file for safety');
+
+// Cleanup orchestrator test sessions
+resetAgentState('orch_test_1');
+resetAgentState('orch_test_2');
+resetAgentState('orch_test_3');
+resetAgentState('orch_test_5');
 
 // ─── Cleanup ─────────────────────────────────────────────────────────────────
 cleanup();

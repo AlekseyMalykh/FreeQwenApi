@@ -14,6 +14,7 @@ import {
     updateCwd,
     buildAgentRuntimeContext
 } from './agentState.js';
+import { runAgentLoop } from './orchestrator.js';
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
@@ -854,9 +855,8 @@ export async function sendMessage(message, model = DEFAULT_MODEL, chatId = null,
 
     let currentParentId = parentId;
 
-    for (let round = 0; round <= 1; round++) {
-        logInfo(`=== Tool execution round ${round} ===`);
-
+    // Create the sendToModel callback for the orchestrator
+    const sendToModel = async (message, runtimeCtx, state) => {
         let page = null;
         try {
             page = await pagePool.getPage(browserContext);
@@ -869,13 +869,27 @@ export async function sendMessage(message, model = DEFAULT_MODEL, chatId = null,
             if (!authToken) {
                 logWarn('Токен отсутствует перед отправкой запроса');
                 authToken = await page.evaluate(() => localStorage.getItem('token'));
-                if (!authToken) return { error: 'Токен авторизации не найден. Требуется перезапуск в ручном режиме.', chatId };
+                if (!authToken) return { error: 'Токен авторизации не найден. Требуется перезапуск в ручном режиме.' };
                 saveAuthToken(authToken);
             }
 
             logInfo('Отправка запроса к API v2...');
 
-            const payload = buildPayloadV2(messageContent, model, chatId, currentParentId, files, effectiveSystemMessage, tools, toolChoice, chatType, size);
+            // Build effective system message with runtime context
+            let stepSystemMessage = systemMessage || '';
+            if (runtimeCtx) {
+                stepSystemMessage = stepSystemMessage
+                    ? `${stepSystemMessage}\n\n${runtimeCtx}`
+                    : runtimeCtx;
+            }
+            if (hasTools) {
+                const toolPrompt = buildToolSystemPrompt(tools, projectRoot);
+                stepSystemMessage = stepSystemMessage
+                    ? `${stepSystemMessage}\n\n${toolPrompt}`
+                    : toolPrompt;
+            }
+
+            const payload = buildPayloadV2(message, model, chatId, currentParentId, files, stepSystemMessage, tools, toolChoice, chatType, size);
             logDebug('=== PAYLOAD V2 ===\n' + JSON.stringify(payload, null, 2));
 
             const apiUrl = `${CHAT_API_URL}?chat_id=${chatId}`;
@@ -883,199 +897,67 @@ export async function sendMessage(message, model = DEFAULT_MODEL, chatId = null,
 
             if (response.success && response.isTask) {
                 logInfo('Обнаружен ответ с задачей (видеогенерация)');
-                logRaw(JSON.stringify(response.data));
-
                 const taskId = extractTaskId(response.data);
-                if (!taskId) {
-                    logError('Task ID не найден в ответе');
-                    pagePool.releasePage(page);
-                    page = null;
-                    return { error: 'Task ID not found in response', chatId, rawResponse: response.data };
-                }
-
-                logInfo(`Task ID: ${taskId}`);
-
-                if (!waitForCompletion) {
-                    logInfo('Возвращаем task_id для клиентского polling');
-                    pagePool.releasePage(page);
-                    page = null;
-                    return {
-                        id: taskId,
-                        object: 'chat.completion.task',
-                        created: Math.floor(Date.now() / 1000),
-                        model,
-                        task_id: taskId,
-                        chatId,
-                        parentId: response.data.data?.parent_id || taskId,
-                        status: 'processing',
-                        message: 'Video generation task created. Poll GET /api/tasks/status/:taskId for progress.'
-                    };
-                }
-
-                logInfo('Начинаем polling для получения видео...');
-                const taskResult = await pollTaskStatus(taskId, page, authToken);
-
-                pagePool.releasePage(page);
-                page = null;
-
-                if (taskResult.success && taskResult.status === 'completed') {
-                    logInfo('Видео успешно сгенерировано');
-                    const videoUrl = extractVideoUrl(taskResult.data);
-                    return {
-                        id: taskId,
-                        object: 'chat.completion',
-                        created: Math.floor(Date.now() / 1000),
-                        model,
-                        choices: [{
-                            index: 0,
-                            message: { role: 'assistant', content: videoUrl || JSON.stringify(taskResult.data) },
-                            finish_reason: 'stop'
-                        }],
-                        usage: taskResult.data.usage || { prompt_tokens: 0, output_tokens: 0, total_tokens: 0 },
-                        response_id: taskId,
-                        chatId,
-                        parentId: taskId,
-                        task_id: taskId,
-                        video_url: videoUrl
-                    };
-                }
-
-                logError(`Не удалось получить видео: ${taskResult.error}`);
-                return { error: taskResult.error || 'Video generation failed', status: taskResult.status, chatId, task_id: taskId };
-            }
-
-            pagePool.releasePage(page);
-            page = null;
-
-            if (response.success) {
-                logRaw(JSON.stringify(response.data));
-                logInfo('Ответ получен успешно');
-                response.data.chatId = chatId;
-                response.data.parentId = response.data.response_id;
-                response.data.id = response.data.id || 'chatcmpl-' + Date.now();
-
-                const message = response.data.choices?.[0]?.message;
-                const content = message?.content || '';
-
-                // Check for tool calls
-                let toolCalls = null;
-                if (hasTools && content) {
-                    toolCalls = parseToolCallFromText(content);
-                }
-
-                if (!toolCalls || toolCalls.length === 0) {
-                    // No tool calls — final response
-                    // Flush buffered chunks if we were buffering
-                    if (hasTools && bufferedChunks.length > 0 && typeof onChunk === 'function') {
-                        for (const chunk of bufferedChunks) onChunk(chunk);
-                    }
-                    if (typeof onChunk === 'function' && content && !response.hasStreamedChunks) {
-                        onChunk(content);
-                    }
-                    return response.data;
-                }
-
-                // We have tool calls — execute them
-                logInfo(`Model requested ${toolCalls.length} tool call(s)`);
-                logInfo(`Tool calls: ${JSON.stringify(toolCalls)}`);
-
-                // Discard buffered chunks (raw JSON, not useful)
-                bufferedChunks.length = 0;
-
-                const toolResults = [];
-                for (const tc of toolCalls) {
-                    const toolName = tc.name;
-                    const toolArgs = tc.arguments || {};
-
-                    logInfo(`Executing: ${toolName}(${JSON.stringify(toolArgs)})`);
-                    const result = await executeTool(toolName, toolArgs, clientWorkdir);
-
-                    // Update agent state based on tool execution
-                    if (agentState) {
-                        // Update cwd if workdir was used
-                        if (toolArgs.workdir) updateCwd(sessionKey, toolArgs.workdir);
-                        
-                        // Track file operations
-                        if (['read_file', 'write_file', 'edit_file', 'apply_patch', 'propose_patch'].includes(toolName) && toolArgs.path) {
-                            touchRecentFile(sessionKey, toolArgs.path);
-                        }
-                        
-                        // Track search operations
-                        if (toolName === 'glob' && toolArgs.pattern) {
-                            setLastSearchResults(sessionKey, {
-                                tool: 'glob',
-                                query: toolArgs.pattern,
-                                resultCount: result.success ? (result.output?.match(/\n/g)?.length || 0) : 0
-                            });
-                        }
-                        if (toolName === 'grep' && toolArgs.pattern) {
-                            setLastSearchResults(sessionKey, {
-                                tool: 'grep',
-                                query: toolArgs.pattern,
-                                resultCount: result.success ? (result.output?.match(/\n/g)?.length || 0) : 0
-                            });
-                        }
-                        
-                        // Track patch operations
-                        if (toolName === 'propose_patch' && result.patch_id) {
-                            setPendingPatch(sessionKey, result.patch_id, toolArgs.path);
-                        }
-                        if (toolName === 'apply_patch' && result.success) {
-                            clearPendingPatch(sessionKey);
-                        }
-                        
-                        // Record action
-                        recordToolAction(sessionKey, {
-                            tool: toolName,
-                            summary: toolArgs.path || toolArgs.command || toolArgs.pattern || '',
-                            success: result.success
-                        });
-                        
-                        // Store last result summary
-                        agentState.lastToolResultSummary = (result.output || result.error || '').substring(0, 200);
-                    }
-
-                    if (result.success) {
-                        toolResults.push(`## Result of ${toolName}:\n${result.output || '(no output)'}`);
-                        logInfo(`Tool ${toolName} OK, output length: ${(result.output || '').length}`);
-                    } else {
-                        toolResults.push(`## Result of ${toolName}:\nError: ${result.error || 'Unknown error'}`);
-                        logError(`Tool ${toolName} failed: ${result.error}`);
-                    }
-                }
-
-                const toolResultsText = toolResults.join('\n\n---\n\n');
-                logInfo(`Tool results ready. Returning directly.`);
-
-                // Qwen API v2 doesn't support multi-turn with tool results.
-                // Return tool output directly to client.
+                if (!taskId) return { error: 'Task ID not found in response' };
                 return {
-                    id: response.data.id || 'chatcmpl-' + Date.now(),
-                    object: 'chat.completion',
+                    id: taskId,
+                    object: 'chat.completion.task',
                     created: Math.floor(Date.now() / 1000),
                     model,
-                    choices: [{
-                        index: 0,
-                        message: { role: 'assistant', content: toolResultsText },
-                        finish_reason: 'tool_calls'
-                    }],
-                    usage: response.data.usage || { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+                    task_id: taskId,
                     chatId,
-                    parentId: response.data.response_id || response.data.parentId,
-                    tool_calls: toolCalls
+                    parentId: response.data.data?.parent_id || taskId,
+                    status: 'processing',
+                    message: 'Video generation task created.'
                 };
             }
 
-            return handleApiError(response, tokenObj, message, model, chatId, currentParentId, files, retryCount, chatType, size, waitForCompletion, onChunk);
+            if (response.success) {
+                response.data.chatId = chatId;
+                response.data.parentId = response.data.response_id;
+                response.data.id = response.data.id || 'chatcmpl-' + Date.now();
+                currentParentId = response.data.response_id;
+                return response.data;
+            }
+
+            return { error: response.error?.toString() || 'API request failed' };
         } catch (error) {
             logError('Ошибка при отправке сообщения', error);
-            return { error: error.toString(), chatId };
+            return { error: error.toString() };
         } finally {
-            if (page) {
-                pagePool.releasePage(page);
-            }
+            if (page) pagePool.releasePage(page);
         }
+    };
+
+    // Run the orchestration loop
+    const result = await runAgentLoop(sendToModel, {
+        sessionKey,
+        clientWorkdir,
+        maxSteps: 5,
+        initialMessage: messageContent,
+        onStep: (stepInfo) => {
+            logInfo(`Step ${stepInfo.step}: ${stepInfo.toolCalls.map(tc => tc.name).join(', ')}`);
+        }
+    });
+
+    // Flush buffered chunks if no tools were called
+    if (hasTools && bufferedChunks.length > 0 && typeof onChunk === 'function') {
+        for (const chunk of bufferedChunks) onChunk(chunk);
     }
+
+    // Attach agent state metadata to response
+    if (result.success && result.lastResponse) {
+        result.lastResponse.agent_state = result.agentState;
+        result.lastResponse.chatId = chatId;
+        return result.lastResponse;
+    }
+
+    // Return error or task result
+    if (result.lastResponse?.object === 'chat.completion.task') {
+        return result.lastResponse;
+    }
+
+    return { error: result.error || 'Agent loop failed', chatId, agent_state: result.agentState };
 }
 
 // ─── Task response helpers ───────────────────────────────────────────────────

@@ -426,11 +426,28 @@ export function parseToolCallFromText(text) {
         const argsBlock = toolCallMatch[2];
         const args = {};
         
-        for (const line of argsBlock.split('\n')) {
-            const argMatch = line.match(/^ARG\s+(\w+):\s*(.+)$/);
+        // Parse ARG lines, accumulating multi-line values
+        const lines = argsBlock.split('\n');
+        let currentArg = null;
+        let currentValue = '';
+        
+        for (const line of lines) {
+            const argMatch = line.match(/^ARG\s+(\w+):\s*(.*)$/);
             if (argMatch) {
-                args[argMatch[1]] = argMatch[2].trim();
+                // Save previous arg
+                if (currentArg) {
+                    args[currentArg] = currentValue.trim();
+                }
+                currentArg = argMatch[1];
+                currentValue = argMatch[2];
+            } else if (currentArg && line.trim()) {
+                // Multi-line value continuation
+                currentValue += '\n' + line;
             }
+        }
+        // Save last arg
+        if (currentArg) {
+            args[currentArg] = currentValue.trim();
         }
         
         if (Object.keys(args).length > 0) {
