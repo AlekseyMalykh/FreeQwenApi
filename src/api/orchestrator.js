@@ -89,7 +89,7 @@ export function inferDirectFileTarget(message, agentState) {
 
     const cwd = agentState.cwd;
     const recentFiles = Array.isArray(agentState.recentFiles) ? agentState.recentFiles : [];
-    if (!cwd || recentFiles.length === 0) return null;
+    if (!cwd) return null;
 
     // If user asks to open a filename after listing a directory, prefer that directory
     const listedDir = agentState.activeDirectoryTarget || agentState.lastListedDirectory || cwd;
@@ -101,29 +101,42 @@ export function inferDirectFileTarget(message, agentState) {
 
     if (!bareNameMatch) return null;
 
-    const requestedName = bareNameMatch[1];
-    if (!requestedName) return null;
-
-    const candidates = recentFiles.filter(f => {
-        const fileName = f.split(/[\\/]/).pop();
-        if (!fileName) return false;
-
-        if (fileName.toLowerCase() === requestedName.toLowerCase()) return true;
-
-        const baseName = fileName.replace(/\.[^.]+$/, '');
-        return baseName.toLowerCase() === requestedName.toLowerCase();
-    });
-
-    if (candidates.length === 0) return null;
-
-    const chosen = candidates[0];
-    const fileName = chosen.split(/[\\/]/).pop();
+    const fileName = bareNameMatch[1];
     if (!fileName) return null;
 
-    return {
-        type: 'file',
-        path: joinPath(listedDir, fileName)
-    };
+    // Try to match against recentFiles first to get full filename with extension
+    if (recentFiles.length > 0) {
+        const candidates = recentFiles.filter(f => {
+            const fFileName = f.split(/[\\/]/).pop();
+            if (!fFileName) return false;
+
+            if (fFileName.toLowerCase() === fileName.toLowerCase()) return true;
+
+            const baseName = fFileName.replace(/\.[^.]+$/, '');
+            return baseName.toLowerCase() === fileName.toLowerCase();
+        });
+
+        if (candidates.length > 0) {
+            const chosen = candidates[0];
+            const chosenFileName = chosen.split(/[\\/]/).pop();
+            if (chosenFileName) {
+                return {
+                    type: 'file',
+                    path: joinPath(listedDir, chosenFileName)
+                };
+            }
+        }
+    }
+
+    // 🔥 Fallback: if there's an active/listed directory, use bare filename
+    if (listedDir) {
+        return {
+            type: 'file',
+            path: joinPath(listedDir, fileName)
+        };
+    }
+
+    return null;
 }
 
 function inferActiveDirectoryTarget(message, agentState) {
