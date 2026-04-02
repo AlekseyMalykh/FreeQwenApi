@@ -18,7 +18,7 @@ export function getAgentState(sessionKey) {
     return entry;
 }
 
-export function createAgentState({ sessionKey, scope, projectRoot, cwd }) {
+export function createAgentState({ sessionKey, scope, projectRoot, cwd, taskGoal }) {
     const state = {
         sessionKey,
         scope: scope || null,
@@ -32,6 +32,19 @@ export function createAgentState({ sessionKey, scope, projectRoot, cwd }) {
         pendingPatchConfirmed: false,
         actionHistory: [],
         lastToolResultSummary: null,
+        
+        // Phase 6: goal-aware runtime
+        taskGoal: taskGoal || null,
+        taskStatus: 'exploring', // exploring | planning | awaiting_approval | done
+        taskSummary: null,
+        lastDecision: null,
+        lastDecisionReason: null,
+        noProgressCount: 0,
+        mode: 'explore', // explore | analyze | propose | done
+        progressSummary: [],
+        seenActions: [], // for repeated action detection
+        lastObservations: [],
+        
         createdAt: Date.now(),
         updatedAt: Date.now()
     };
@@ -40,10 +53,10 @@ export function createAgentState({ sessionKey, scope, projectRoot, cwd }) {
     return state;
 }
 
-export function getOrCreateAgentState({ sessionKey, scope, projectRoot, cwd }) {
+export function getOrCreateAgentState({ sessionKey, scope, projectRoot, cwd, taskGoal }) {
     let state = getAgentState(sessionKey);
     if (!state) {
-        state = createAgentState({ sessionKey, scope, projectRoot, cwd });
+        state = createAgentState({ sessionKey, scope, projectRoot, cwd, taskGoal });
     }
     // Update projectRoot/cwd if provided
     if (projectRoot && state.projectRoot !== projectRoot) {
@@ -51,6 +64,10 @@ export function getOrCreateAgentState({ sessionKey, scope, projectRoot, cwd }) {
         if (!cwd) state.cwd = projectRoot;
     }
     if (cwd) state.cwd = cwd;
+    // Update taskGoal if provided and not already set
+    if (taskGoal && !state.taskGoal) {
+        state.taskGoal = taskGoal;
+    }
     state.updatedAt = Date.now();
     return state;
 }
@@ -187,6 +204,18 @@ export function buildAgentRuntimeContext(state) {
     parts.push(`Current project root: ${state.projectRoot}`);
     parts.push(`Current working directory: ${state.cwd}`);
     
+    // Phase 6: goal-aware context
+    if (state.taskGoal) {
+        parts.push(`\nTASK GOAL: ${state.taskGoal}`);
+    }
+    parts.push(`CURRENT STATUS: ${state.taskStatus}`);
+    parts.push(`MODE: ${state.mode}`);
+    
+    if (state.progressSummary.length > 0) {
+        parts.push('\nPROGRESS SUMMARY:');
+        state.progressSummary.slice(-5).forEach(p => parts.push(`- ${p}`));
+    }
+    
     if (state.recentFiles.length > 0) {
         parts.push('\nRecent files:');
         state.recentFiles.slice(0, 10).forEach(f => parts.push(`- ${f}`));
@@ -203,6 +232,14 @@ export function buildAgentRuntimeContext(state) {
         parts.push(`\nPending patch: ${state.pendingPatchId} for ${state.pendingPatchFile}${state.pendingPatchConfirmed ? ' (confirmed)' : ' (awaiting approval)'}`);
     }
     
+    if (state.lastDecision) {
+        parts.push(`\nRECENT DECISION: ${state.lastDecision}`);
+    }
+    
+    if (state.noProgressCount > 0) {
+        parts.push(`\nNo progress steps: ${state.noProgressCount}`);
+    }
+    
     if (state.actionHistory.length > 0) {
         parts.push('\nRecent actions:');
         state.actionHistory.slice(-5).forEach(a => {
@@ -210,9 +247,112 @@ export function buildAgentRuntimeContext(state) {
         });
     }
     
-    if (state.lastToolResultSummary) {
-        parts.push(`\nLast tool result: ${state.lastToolResultSummary}`);
+    return parts.join('\n');
+}
+
+// ─── Phase 6: Goal-aware agent helpers ───────────────────────────────────────
+
+export function setTaskGoal(sessionKey, goal) {
+    const state = sessionAgentState.get(sessionKey);
+    if (!state) return;
+    state.taskGoal = goal;
+    state.taskStatus = 'exploring';
+    state.mode = 'explore';
+    state.progressSummary = [];
+    state.noProgressCount = 0;
+    state.seenActions = [];
+    state.updatedAt = Date.now();
+}
+
+export function updateTaskStatus(sessionKey, status) {
+    const state = sessionAgentState.get(sessionKey);
+    if (!state) return;
+    state.taskStatus = status;
+    state.updatedAt = Date.now();
+}
+
+export function setAgentMode(sessionKey, mode) {
+    const state = sessionAgentState.get(sessionKey);
+    if (!state) return;
+    state.mode = mode;
+    state.updatedAt = Date.now();
+}
+
+export function addProgressEntry(sessionKey, entry) {
+    const state = sessionAgentState.get(sessionKey);
+    if (!state) return;
+    state.progressSummary.push(entry);
+    state.noProgressCount = 0; // reset on progress
+    state.updatedAt = Date.now();
+}
+
+export function incrementNoProgress(sessionKey) {
+    const state = sessionAgentState.get(sessionKey);
+    if (!state) return 0;
+    state.noProgressCount++;
+    state.updatedAt = Date.now();
+    return state.noProgressCount;
+}
+
+export function recordSeenAction(sessionKey, toolName, args) {
+    const state = sessionAgentState.get(sessionKey);
+    if (!state) return false;
+    
+    const actionKey = `${toolName}:${JSON.stringify(args || {})}`;
+    const isRepeated = state.seenActions.includes(actionKey);
+    
+    state.seenActions.push(actionKey);
+    // Keep last 20 actions for detection
+    if (state.seenActions.length > 20) {
+        state.seenActions = state.seenActions.slice(-20);
     }
     
-    return parts.join('\n');
+    state.updatedAt = Date.now();
+    return isRepeated;
+}
+
+export function setLastDecision(sessionKey, decision, reason) {
+    const state = sessionAgentState.get(sessionKey);
+    if (!state) return;
+    state.lastDecision = decision;
+    state.lastDecisionReason = reason;
+    state.updatedAt = Date.now();
+}
+
+export function addObservation(sessionKey, observation) {
+    const state = sessionAgentState.get(sessionKey);
+    if (!state) return;
+    state.lastObservations.push(observation);
+    if (state.lastObservations.length > 5) {
+        state.lastObservations = state.lastObservations.slice(-5);
+    }
+    state.updatedAt = Date.now();
+}
+
+// Auto-transition mode based on state
+export function autoTransitionMode(sessionKey) {
+    const state = sessionAgentState.get(sessionKey);
+    if (!state) return state?.mode || 'explore';
+    
+    // If patch is pending, we're awaiting approval
+    if (state.pendingPatchId && !state.pendingPatchConfirmed) {
+        state.mode = 'propose';
+        state.taskStatus = 'awaiting_approval';
+        return state.mode;
+    }
+    
+    // If we've read files and found search results, move to analyze
+    if (state.mode === 'explore' && state.lastSearchResults.length > 0 && state.recentFiles.length > 0) {
+        state.mode = 'analyze';
+        state.taskStatus = 'planning';
+    }
+    
+    // If we've analyzed enough, move to propose
+    if (state.mode === 'analyze' && state.recentFiles.length >= 2) {
+        state.mode = 'propose';
+        state.taskStatus = 'planning';
+    }
+    
+    state.updatedAt = Date.now();
+    return state.mode;
 }

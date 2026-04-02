@@ -58,3 +58,9 @@ export const LOG_MAX_FILES = Number(process.env.LOG_MAX_FILES) || 5;
 
 // ─── Tools (experimental) ────────────────────────────────────────────────────
 export const ENABLE_BASH_TOOL = toBoolean(process.env.ENABLE_BASH_TOOL);
+
+// ─── Phase 6: Agent ──────────────────────────────────────────────────────────
+export const ENABLE_GOAL_AWARE_AGENT = toBoolean(process.env.ENABLE_GOAL_AWARE_AGENT);
+export const AGENT_NO_PROGRESS_LIMIT = Number(process.env.AGENT_NO_PROGRESS_LIMIT) || 2;
+export const AGENT_MAX_READFILE_LINES = Number(process.env.AGENT_MAX_READFILE_LINES) || 200;
+export const AGENT_MAX_OBSERVATION_CHARS = Number(process.env.AGENT_MAX_OBSERVATION_CHARS) || 1500;

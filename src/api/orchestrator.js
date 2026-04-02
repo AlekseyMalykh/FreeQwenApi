@@ -7,12 +7,30 @@ import {
     touchRecentFile,
     setLastSearchResults,
     updateCwd,
-    buildAgentRuntimeContext
+    buildAgentRuntimeContext,
+    setTaskGoal,
+    updateTaskStatus,
+    setAgentMode,
+    addProgressEntry,
+    incrementNoProgress,
+    recordSeenAction,
+    setLastDecision,
+    addObservation,
+    autoTransitionMode
 } from './agentState.js';
 import { executeTool, parseToolCallFromText } from '../tools/toolExecutor.js';
+import { buildToolObservation, isRepeatedAction, hasProgress } from './toolObservation.js';
+import { AGENT_NO_PROGRESS_LIMIT, ENABLE_GOAL_AWARE_AGENT } from '../config.js';
 
 const DEFAULT_MAX_STEPS = 5;
-const MAX_TOOL_RESULT_CHARS = 2000;
+
+// Tool policies per mode
+const TOOLS_BY_MODE = {
+    explore: ['glob', 'grep', 'read_file', 'bash'],
+    analyze: ['read_file', 'grep', 'bash'],
+    propose: ['propose_patch', 'read_file'],
+    done: []
+};
 
 /**
  * Summarize tool output for the model (prevent context overflow)
@@ -23,8 +41,8 @@ function summarizeToolResult(toolName, result) {
     }
     
     const output = result.output || '(no output)';
-    const summary = output.length > MAX_TOOL_RESULT_CHARS
-        ? output.substring(0, MAX_TOOL_RESULT_CHARS) + `\n... (output truncated, ${output.length} total chars)`
+    const summary = output.length > 2000
+        ? output.substring(0, 2000) + `\n... (output truncated, ${output.length} total chars)`
         : output;
     
     return summary;
@@ -33,7 +51,7 @@ function summarizeToolResult(toolName, result) {
 /**
  * Check if the tool call should stop the loop
  */
-function shouldStopLoop(toolCalls, step, maxSteps) {
+function checkStopConditions(toolCalls, step, maxSteps, state) {
     if (step >= maxSteps) return { stop: true, reason: `Max steps (${maxSteps}) reached` };
     
     for (const tc of toolCalls) {
@@ -44,41 +62,50 @@ function shouldStopLoop(toolCalls, step, maxSteps) {
         if (name === 'write_file') return { stop: true, reason: 'write_file called, stopping for safety' };
     }
     
+    // Check no progress limit
+    if (state && state.noProgressCount >= AGENT_NO_PROGRESS_LIMIT) {
+        return { stop: true, reason: `No progress for ${state.noProgressCount} steps` };
+    }
+    
     return { stop: false };
 }
 
 /**
- * Build the conversation for the next step
+ * Build the next message for the model with goal-aware context
  */
-function buildNextMessage(toolCalls, toolResults, step) {
-    const resultSummaries = toolResults
-        .map((r, i) => {
-            const tc = toolCalls[i];
-            return `Step ${step + 1} — ${tc.name} result:\n${r}`;
-        })
-        .join('\n\n');
+function buildNextMessage(toolCalls, observations, state, step) {
+    const goalBlock = state?.taskGoal ? `\nYou are working on this task:\n${state.taskGoal}\n` : '';
+    const modeBlock = `Current mode: ${state?.mode || 'explore'}`;
     
-    return `Here are the results of your last actions:\n\n${resultSummaries}\n\nContinue with the next step. If the task is complete, say so.`;
+    const progressBlock = state?.progressSummary.length > 0
+        ? `\nProgress so far:\n${state.progressSummary.slice(-5).map(p => `- ${p}`).join('\n')}`
+        : '';
+    
+    const obsBlock = observations.length > 0
+        ? `\nLatest observations:\n${observations.slice(-3).map(o => `- ${o.summary || o}`).join('\n')}`
+        : '';
+    
+    const guidance = `\nDecide the single best next step.
+You may:
+- explore more files (glob, grep)
+- inspect a file in detail (read_file)
+- propose a patch (propose_patch)
+- finish if the task is complete
+
+Do not repeat a previous action unless it is necessary.
+Prefer propose_patch instead of write_file for code changes.`;
+    
+    return `${goalBlock}${modeBlock}${progressBlock}${obsBlock}${guidance}`;
 }
 
 /**
- * Run the agent orchestration loop.
- * 
- * This replaces the single-step tool execution with a controlled multi-step loop:
- * 1. Send message to model
- * 2. Parse tool calls
- * 3. Execute tools
- * 4. Update agent state
- * 5. Check stop conditions
- * 6. If not stopped, go to step 1 with tool results
- * 
- * @param {Function} sendToModel - Function that sends a message to the model and returns the response
- * @param {Object} options
- * @param {string} options.sessionKey - Session key for agent state
- * @param {string} options.clientWorkdir - Working directory from client
- * @param {number} options.maxSteps - Maximum number of tool execution steps
- * @param {Function} options.onStep - Callback called after each step
- * @returns {Object} Final result
+ * Run the agent orchestration loop with Phase 6 features:
+ * - Goal-aware runtime context
+ * - Mode transitions (explore -> analyze -> propose)
+ * - Progress tracking
+ * - Repeated action detection
+ * - Structured observations
+ * - Smarter stop conditions
  */
 export async function runAgentLoop(sendToModel, options = {}) {
     const {
@@ -93,20 +120,26 @@ export async function runAgentLoop(sendToModel, options = {}) {
     const agentState = getOrCreateAgentState({
         sessionKey,
         projectRoot,
-        cwd: clientWorkdir
+        cwd: clientWorkdir,
+        taskGoal: options.initialMessage?.substring(0, 200) // Use first message as goal
     });
     
-    logInfo(`Agent loop started for session: ${sessionKey}, maxSteps: ${maxSteps}`);
+    // Set task goal if provided
+    if (options.initialMessage && !agentState.taskGoal) {
+        setTaskGoal(sessionKey, options.initialMessage.substring(0, 200));
+    }
+    
+    logInfo(`Agent loop started for session: ${sessionKey}, maxSteps: ${maxSteps}, mode: ${agentState.mode}`);
     
     let currentMessage = options.initialMessage;
     let allToolCalls = [];
-    let allToolResults = [];
+    let allObservations = [];
     let lastResponse = null;
     let stopped = false;
     let stopReason = '';
     
     for (let step = 0; step < maxSteps; step++) {
-        logInfo(`=== Agent loop step ${step + 1}/${maxSteps} ===`);
+        logInfo(`=== Agent loop step ${step + 1}/${maxSteps} (mode: ${agentState.mode}) ===`);
         
         // Build runtime context for this step
         const runtimeContext = buildAgentRuntimeContext(agentState);
@@ -121,8 +154,9 @@ export async function runAgentLoop(sendToModel, options = {}) {
                 error: response?.error || 'Model response failed',
                 steps: step,
                 toolCalls: allToolCalls,
-                toolResults: allToolResults,
-                lastResponse
+                observations: allObservations,
+                lastResponse,
+                agent: buildAgentMetadata(agentState, stopReason)
             };
         }
         
@@ -137,47 +171,79 @@ export async function runAgentLoop(sendToModel, options = {}) {
             logInfo(`Agent loop completed at step ${step + 1}: no more tool calls`);
             stopped = true;
             stopReason = 'Task completed';
+            agentState.taskStatus = 'done';
+            agentState.mode = 'done';
             break;
         }
         
         // Check stop conditions
-        const stopCheck = shouldStopLoop(toolCalls, step, maxSteps);
+        const stopCheck = checkStopConditions(toolCalls, step, maxSteps, agentState);
         if (stopCheck.stop) {
             logInfo(`Agent loop stopped: ${stopCheck.reason}`);
             stopped = true;
             stopReason = stopCheck.reason;
             
             // Still execute the tool calls (e.g., propose_patch)
-            const toolResults = await executeToolCalls(toolCalls, agentState, sessionKey, clientWorkdir);
+            const { observations } = await executeToolCalls(toolCalls, agentState, sessionKey, clientWorkdir);
             allToolCalls.push(...toolCalls);
-            allToolResults.push(...toolResults);
+            allObservations.push(...observations);
             
             break;
         }
         
         // Execute tool calls
         logInfo(`Executing ${toolCalls.length} tool call(s) at step ${step + 1}`);
-        const toolResults = await executeToolCalls(toolCalls, agentState, sessionKey, clientWorkdir);
+        const { observations } = await executeToolCalls(toolCalls, agentState, sessionKey, clientWorkdir);
         
         allToolCalls.push(...toolCalls);
-        allToolResults.push(...toolResults);
+        allObservations.push(...observations);
+        
+        // Check for progress
+        let hadProgress = false;
+        for (let i = 0; i < toolCalls.length; i++) {
+            const tc = toolCalls[i];
+            const obs = observations[i];
+            
+            // Check for repeated action
+            const isRepeated = recordSeenAction(sessionKey, tc.name, tc.arguments);
+            if (isRepeated) {
+                incrementNoProgress(sessionKey);
+                logWarn(`Repeated action detected: ${tc.name}`);
+            } else if (hasProgress(agentState, tc.name, obs)) {
+                hadProgress = true;
+                addProgressEntry(sessionKey, `${tc.name}: ${tc.arguments?.path || tc.arguments?.command || tc.arguments?.pattern || ''}`);
+            }
+        }
+        
+        if (!hadProgress) {
+            const count = incrementNoProgress(sessionKey);
+            logWarn(`No progress step ${count}/${AGENT_NO_PROGRESS_LIMIT}`);
+        }
+        
+        // Auto-transition mode
+        autoTransitionMode(sessionKey);
+        
+        // Record decision
+        setLastDecision(sessionKey, toolCalls.map(tc => tc.name).join(', '), `Step ${step + 1}`);
         
         // Callback for progress reporting
         if (onStep) {
             onStep({
                 step: step + 1,
                 toolCalls,
-                toolResults,
+                observations,
                 agentState: {
+                    mode: agentState.mode,
+                    taskStatus: agentState.taskStatus,
                     recentFiles: agentState.recentFiles,
                     pendingPatchId: agentState.pendingPatchId,
-                    actionHistory: agentState.actionHistory.slice(-3)
+                    noProgressCount: agentState.noProgressCount
                 }
             });
         }
         
         // Build next message
-        currentMessage = buildNextMessage(toolCalls, toolResults, step);
+        currentMessage = buildNextMessage(toolCalls, observations, agentState, step);
     }
     
     // If we exited the loop without stopping, it means max steps reached
@@ -186,31 +252,25 @@ export async function runAgentLoop(sendToModel, options = {}) {
         stopReason = `Max steps (${maxSteps}) reached`;
     }
     
-    logInfo(`Agent loop finished: ${stopped ? stopReason : 'max steps reached'}, ${allToolCalls.length} total tool calls`);
+    logInfo(`Agent loop finished: ${stopReason}, ${allToolCalls.length} total tool calls`);
     
     return {
         success: true,
         stopped,
         stopReason,
-        steps: allToolCalls.length > 0 ? Math.ceil(allToolCalls.length / 1) : 0,
+        steps: allToolCalls.length,
         toolCalls: allToolCalls,
-        toolResults: allToolResults,
+        observations: allObservations,
         lastResponse,
-        agentState: {
-            recentFiles: agentState.recentFiles,
-            pendingPatchId: agentState.pendingPatchId,
-            pendingPatchFile: agentState.pendingPatchFile,
-            pendingPatchConfirmed: agentState.pendingPatchConfirmed,
-            actionHistory: agentState.actionHistory.slice(-5)
-        }
+        agent: buildAgentMetadata(agentState, stopReason)
     };
 }
 
 /**
- * Execute a batch of tool calls and update agent state
+ * Execute a batch of tool calls and update agent state with structured observations
  */
 async function executeToolCalls(toolCalls, agentState, sessionKey, clientWorkdir) {
-    const results = [];
+    const observations = [];
     
     for (const tc of toolCalls) {
         const toolName = tc.name;
@@ -218,6 +278,10 @@ async function executeToolCalls(toolCalls, agentState, sessionKey, clientWorkdir
         
         logInfo(`Executing: ${toolName}(${JSON.stringify(toolArgs)})`);
         const result = await executeTool(toolName, toolArgs, clientWorkdir);
+        
+        // Build structured observation
+        const observation = buildToolObservation(toolName, toolArgs, result);
+        observations.push(observation);
         
         // Update agent state
         if (agentState) {
@@ -231,21 +295,21 @@ async function executeToolCalls(toolCalls, agentState, sessionKey, clientWorkdir
                 setLastSearchResults(sessionKey, {
                     tool: 'glob',
                     query: toolArgs.pattern,
-                    resultCount: result.success ? (result.output?.match(/\n/g)?.length || 0) : 0
+                    resultCount: observation.fileCount || 0
                 });
             }
             if (toolName === 'grep' && toolArgs.pattern) {
                 setLastSearchResults(sessionKey, {
                     tool: 'grep',
                     query: toolArgs.pattern,
-                    resultCount: result.success ? (result.output?.match(/\n/g)?.length || 0) : 0
+                    resultCount: observation.matchCount || 0
                 });
             }
             
-            if (toolName === 'propose_patch' && result.patch_id) {
-                setPendingPatch(sessionKey, result.patch_id, toolArgs.path);
+            if (toolName === 'propose_patch' && observation.patchId) {
+                setPendingPatch(sessionKey, observation.patchId, toolArgs.path);
             }
-            if (toolName === 'apply_patch' && result.success) {
+            if (toolName === 'apply_patch' && observation.success) {
                 clearPendingPatch(sessionKey);
             }
             
@@ -255,11 +319,28 @@ async function executeToolCalls(toolCalls, agentState, sessionKey, clientWorkdir
                 success: result.success
             });
             
-            agentState.lastToolResultSummary = summarizeToolResult(toolName, result).substring(0, 200);
+            addObservation(sessionKey, observation);
+            agentState.lastToolResultSummary = observation.summary?.substring(0, 200) || '';
         }
-        
-        results.push(summarizeToolResult(toolName, result));
     }
     
-    return results;
+    return { observations };
+}
+
+/**
+ * Build agent metadata for response
+ */
+function buildAgentMetadata(state, stopReason) {
+    if (!state) return null;
+    return {
+        mode: state.mode,
+        taskStatus: state.taskStatus,
+        taskGoal: state.taskGoal,
+        stopReason,
+        stepsUsed: state.actionHistory?.length || 0,
+        progressSummary: state.progressSummary?.slice(-5) || [],
+        recentFiles: state.recentFiles?.slice(0, 5) || [],
+        pendingPatchId: state.pendingPatchId,
+        noProgressCount: state.noProgressCount
+    };
 }
