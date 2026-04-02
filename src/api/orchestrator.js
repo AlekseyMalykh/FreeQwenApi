@@ -4,13 +4,12 @@ import {
     recordToolAction,
     setPendingPatch,
     clearPendingPatch,
+    markPatchApplied,
     touchRecentFile,
     setLastSearchResults,
     updateCwd,
     buildAgentRuntimeContext,
     setTaskGoal,
-    updateTaskStatus,
-    setAgentMode,
     addProgressEntry,
     incrementNoProgress,
     recordSeenAction,
@@ -19,34 +18,10 @@ import {
     autoTransitionMode
 } from './agentState.js';
 import { executeTool, parseToolCallFromText } from '../tools/toolExecutor.js';
-import { buildToolObservation, isRepeatedAction, hasProgress } from './toolObservation.js';
-import { AGENT_NO_PROGRESS_LIMIT, ENABLE_GOAL_AWARE_AGENT } from '../config.js';
+import { buildToolObservation, hasProgress } from './toolObservation.js';
+import { AGENT_NO_PROGRESS_LIMIT } from '../config.js';
 
 const DEFAULT_MAX_STEPS = 5;
-
-// Tool policies per mode
-const TOOLS_BY_MODE = {
-    explore: ['glob', 'grep', 'read_file', 'bash'],
-    analyze: ['read_file', 'grep', 'bash'],
-    propose: ['propose_patch', 'read_file'],
-    done: []
-};
-
-/**
- * Summarize tool output for the model (prevent context overflow)
- */
-function summarizeToolResult(toolName, result) {
-    if (!result.success) {
-        return `Tool ${toolName} failed: ${result.error || 'Unknown error'}`;
-    }
-    
-    const output = result.output || '(no output)';
-    const summary = output.length > 2000
-        ? output.substring(0, 2000) + `\n... (output truncated, ${output.length} total chars)`
-        : output;
-    
-    return summary;
-}
 
 /**
  * Check if the tool call should stop the loop
@@ -121,7 +96,9 @@ export async function runAgentLoop(sendToModel, options = {}) {
         sessionKey,
         projectRoot,
         cwd: clientWorkdir,
-        taskGoal: options.initialMessage?.substring(0, 200) // Use first message as goal
+        taskGoal: options.initialMessage?.substring(0, 200),
+        chatId: options.chatId,
+        parentId: options.parentId
     });
     
     // Set task goal if provided
@@ -204,11 +181,11 @@ export async function runAgentLoop(sendToModel, options = {}) {
             const tc = toolCalls[i];
             const obs = observations[i];
             
-            // Check for repeated action
+            // Check for repeated action (semantic: same tool + same args)
             const isRepeated = recordSeenAction(sessionKey, tc.name, tc.arguments);
             if (isRepeated) {
                 incrementNoProgress(sessionKey);
-                logWarn(`Repeated action detected: ${tc.name}`);
+                logWarn(`Repeated action detected: ${tc.name}(${JSON.stringify(tc.arguments)})`);
             } else if (hasProgress(agentState, tc.name, obs)) {
                 hadProgress = true;
                 addProgressEntry(sessionKey, `${tc.name}: ${tc.arguments?.path || tc.arguments?.command || tc.arguments?.pattern || ''}`);
@@ -236,7 +213,7 @@ export async function runAgentLoop(sendToModel, options = {}) {
                     mode: agentState.mode,
                     taskStatus: agentState.taskStatus,
                     recentFiles: agentState.recentFiles,
-                    pendingPatchId: agentState.pendingPatchId,
+                    patchState: agentState.patchState,
                     noProgressCount: agentState.noProgressCount
                 }
             });
@@ -310,6 +287,7 @@ async function executeToolCalls(toolCalls, agentState, sessionKey, clientWorkdir
                 setPendingPatch(sessionKey, observation.patchId, toolArgs.path);
             }
             if (toolName === 'apply_patch' && observation.success) {
+                markPatchApplied(sessionKey);
                 clearPendingPatch(sessionKey);
             }
             
@@ -333,6 +311,9 @@ async function executeToolCalls(toolCalls, agentState, sessionKey, clientWorkdir
 function buildAgentMetadata(state, stopReason) {
     if (!state) return null;
     return {
+        sessionKey: state.sessionKey,
+        chatId: state.chatId,
+        parentId: state.parentId,
         mode: state.mode,
         taskStatus: state.taskStatus,
         taskGoal: state.taskGoal,
@@ -340,7 +321,7 @@ function buildAgentMetadata(state, stopReason) {
         stepsUsed: state.actionHistory?.length || 0,
         progressSummary: state.progressSummary?.slice(-5) || [],
         recentFiles: state.recentFiles?.slice(0, 5) || [],
-        pendingPatchId: state.pendingPatchId,
+        patchState: state.patchState,
         noProgressCount: state.noProgressCount
     };
 }

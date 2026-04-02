@@ -246,5 +246,10 @@ export function hasProgress(state, toolName, observation) {
         return true;
     }
     
+    // Bash with output = progress
+    if (toolName === 'bash' && observation.summary && observation.summary !== '(no output)') {
+        return true;
+    }
+    
     return false;
 }

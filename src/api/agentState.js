@@ -1,4 +1,5 @@
 import { logInfo, logError, logDebug } from '../logger/index.js';
+import crypto from 'crypto';
 
 // ─── Session agent state storage ─────────────────────────────────────────────
 const sessionAgentState = new Map();
@@ -6,6 +7,32 @@ const STATE_TTL = 2 * 60 * 60 * 1000; // 2 hours
 const MAX_RECENT_FILES = 20;
 const MAX_SEARCH_RESULTS = 5;
 const MAX_ACTION_HISTORY = 50;
+
+/**
+ * Resolve or generate a local session key for agent state.
+ * 
+ * Priority:
+ * 1. x-session-key header (explicit local session identity)
+ * 2. conversation_id from request body (if it looks like a local ID)
+ * 3. Generate new local session key
+ * 
+ * chatId (upstream Qwen conversation id) is stored separately in state,
+ * NOT used as sessionKey.
+ */
+export function resolveSessionKey(headers, body) {
+    // 1. Explicit session key from header
+    const headerKey = headers?.['x-session-key'] || headers?.['x-agent-session'];
+    if (headerKey) return headerKey;
+    
+    // 2. conversation_id from body (if it looks like a local ID, not Qwen chatId)
+    const conversationId = body?.conversation_id;
+    if (conversationId && !conversationId.match(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/)) {
+        return `conv_${conversationId}`;
+    }
+    
+    // 3. Generate new local session key
+    return `session_${crypto.randomUUID().substring(0, 12)}`;
+}
 
 export function getAgentState(sessionKey) {
     const entry = sessionAgentState.get(sessionKey);
@@ -18,18 +45,19 @@ export function getAgentState(sessionKey) {
     return entry;
 }
 
-export function createAgentState({ sessionKey, scope, projectRoot, cwd, taskGoal }) {
+export function createAgentState({ sessionKey, scope, projectRoot, cwd, taskGoal, chatId, parentId }) {
     const state = {
         sessionKey,
         scope: scope || null,
         projectRoot: projectRoot || process.cwd(),
         cwd: cwd || projectRoot || process.cwd(),
+        
+        // Upstream Qwen conversation linkage (separate from local sessionKey)
+        chatId: chatId || null,
+        parentId: parentId || null,
+        
         recentFiles: [],
-        lastReadFiles: [],
         lastSearchResults: [],
-        pendingPatchId: null,
-        pendingPatchFile: null,
-        pendingPatchConfirmed: false,
         actionHistory: [],
         lastToolResultSummary: null,
         
@@ -45,6 +73,16 @@ export function createAgentState({ sessionKey, scope, projectRoot, cwd, taskGoal
         seenActions: [], // for repeated action detection
         lastObservations: [],
         
+        // Patch lifecycle state machine
+        patchState: {
+            id: null,
+            file: null,
+            status: 'none', // none | pending | confirmed | rejected | applied
+            confirmedAt: null,
+            rejectedAt: null,
+            appliedAt: null
+        },
+        
         createdAt: Date.now(),
         updatedAt: Date.now()
     };
@@ -53,10 +91,10 @@ export function createAgentState({ sessionKey, scope, projectRoot, cwd, taskGoal
     return state;
 }
 
-export function getOrCreateAgentState({ sessionKey, scope, projectRoot, cwd, taskGoal }) {
+export function getOrCreateAgentState({ sessionKey, scope, projectRoot, cwd, taskGoal, chatId, parentId }) {
     let state = getAgentState(sessionKey);
     if (!state) {
-        state = createAgentState({ sessionKey, scope, projectRoot, cwd, taskGoal });
+        state = createAgentState({ sessionKey, scope, projectRoot, cwd, taskGoal, chatId, parentId });
     }
     // Update projectRoot/cwd if provided
     if (projectRoot && state.projectRoot !== projectRoot) {
@@ -68,6 +106,9 @@ export function getOrCreateAgentState({ sessionKey, scope, projectRoot, cwd, tas
     if (taskGoal && !state.taskGoal) {
         state.taskGoal = taskGoal;
     }
+    // Store upstream Qwen linkage if provided
+    if (chatId) state.chatId = chatId;
+    if (parentId) state.parentId = parentId;
     state.updatedAt = Date.now();
     return state;
 }
@@ -98,29 +139,68 @@ export function recordToolAction(sessionKey, action) {
     state.updatedAt = Date.now();
 }
 
+// ─── Patch lifecycle state machine ───────────────────────────────────────────
+// States: none -> pending -> (confirmed -> applied) | rejected
+
 export function setPendingPatch(sessionKey, patchId, filePath) {
     const state = sessionAgentState.get(sessionKey);
     if (!state) return;
-    state.pendingPatchId = patchId;
-    state.pendingPatchFile = filePath;
-    state.pendingPatchConfirmed = false;
+    state.patchState = {
+        id: patchId,
+        file: filePath,
+        status: 'pending',
+        confirmedAt: null,
+        rejectedAt: null,
+        appliedAt: null
+    };
+    state.taskStatus = 'awaiting_approval';
+    state.mode = 'propose';
     state.updatedAt = Date.now();
 }
 
-export function confirmSessionPatch(sessionKey) {
+export function confirmPendingPatch(sessionKey) {
     const state = sessionAgentState.get(sessionKey);
-    if (!state || !state.pendingPatchId) return false;
-    state.pendingPatchConfirmed = true;
+    if (!state || state.patchState.status !== 'pending') return false;
+    state.patchState.status = 'confirmed';
+    state.patchState.confirmedAt = Date.now();
     state.updatedAt = Date.now();
     return true;
+}
+
+export function confirmSessionPatch(sessionKey) {
+    return confirmPendingPatch(sessionKey);
+}
+
+export function rejectPendingPatch(sessionKey) {
+    const state = sessionAgentState.get(sessionKey);
+    if (!state || state.patchState.status === 'none') return false;
+    state.patchState.status = 'rejected';
+    state.patchState.rejectedAt = Date.now();
+    state.mode = state.mode === 'propose' ? 'analyze' : state.mode;
+    state.taskStatus = state.taskStatus === 'awaiting_approval' ? 'planning' : state.taskStatus;
+    state.updatedAt = Date.now();
+    return true;
+}
+
+export function markPatchApplied(sessionKey) {
+    const state = sessionAgentState.get(sessionKey);
+    if (!state) return;
+    state.patchState.status = 'applied';
+    state.patchState.appliedAt = Date.now();
+    state.updatedAt = Date.now();
 }
 
 export function clearPendingPatch(sessionKey) {
     const state = sessionAgentState.get(sessionKey);
     if (!state) return;
-    state.pendingPatchId = null;
-    state.pendingPatchFile = null;
-    state.pendingPatchConfirmed = false;
+    state.patchState = {
+        id: null,
+        file: null,
+        status: 'none',
+        confirmedAt: null,
+        rejectedAt: null,
+        appliedAt: null
+    };
     state.updatedAt = Date.now();
 }
 
@@ -132,9 +212,6 @@ export function touchRecentFile(sessionKey, filePath) {
     state.recentFiles = state.recentFiles.filter(f => f !== filePath);
     state.recentFiles.unshift(filePath);
     state.recentFiles = state.recentFiles.slice(0, MAX_RECENT_FILES);
-    
-    state.lastReadFiles.push({ path: filePath, at: Date.now() });
-    state.lastReadFiles = state.lastReadFiles.slice(-MAX_RECENT_FILES);
     
     state.updatedAt = Date.now();
 }
@@ -199,52 +276,65 @@ export function buildAgentRuntimeContext(state) {
     if (!state) return '';
     
     const parts = [];
+    const MAX_BLOCK_LINES = 8;
+    const MAX_SUMMARY_CHARS = 120;
     
-    parts.push('RUNTIME CONTEXT:');
-    parts.push(`Current project root: ${state.projectRoot}`);
-    parts.push(`Current working directory: ${state.cwd}`);
-    
-    // Phase 6: goal-aware context
+    // Priority 1: Task goal and status (always first)
     if (state.taskGoal) {
-        parts.push(`\nTASK GOAL: ${state.taskGoal}`);
+        parts.push(`TASK GOAL: ${state.taskGoal.substring(0, MAX_SUMMARY_CHARS)}`);
     }
-    parts.push(`CURRENT STATUS: ${state.taskStatus}`);
+    parts.push(`STATUS: ${state.taskStatus}`);
     parts.push(`MODE: ${state.mode}`);
     
+    // Priority 2: Location
+    parts.push(`PROJECT: ${state.projectRoot}`);
+    parts.push(`CWD: ${state.cwd}`);
+    
+    // Priority 3: Pending patch state (critical for decision making)
+    if (state.patchState?.status && state.patchState.status !== 'none') {
+        const ps = state.patchState;
+        const patchInfo = `PATCH: ${ps.status} (${ps.id?.substring(0, 12) || 'unknown'}) for ${ps.file || 'unknown'}`;
+        parts.push(patchInfo);
+    }
+    
+    // Priority 4: Progress summary (concise)
     if (state.progressSummary.length > 0) {
-        parts.push('\nPROGRESS SUMMARY:');
-        state.progressSummary.slice(-5).forEach(p => parts.push(`- ${p}`));
+        const recent = state.progressSummary.slice(-3);
+        parts.push(`PROGRESS: ${recent.join(' | ').substring(0, MAX_SUMMARY_CHARS)}`);
     }
     
+    // Priority 5: Recent decisive observations
+    if (state.lastObservations.length > 0) {
+        const recent = state.lastObservations.slice(-2)
+            .map(o => o.summary || o.tool || '')
+            .filter(Boolean)
+            .slice(0, MAX_BLOCK_LINES);
+        if (recent.length > 0) {
+            parts.push(`OBSERVATIONS: ${recent.join(' | ').substring(0, MAX_SUMMARY_CHARS)}`);
+        }
+    }
+    
+    // Priority 6: Recent files (limited)
     if (state.recentFiles.length > 0) {
-        parts.push('\nRecent files:');
-        state.recentFiles.slice(0, 10).forEach(f => parts.push(`- ${f}`));
+        const files = state.recentFiles.slice(0, 5);
+        parts.push(`FILES: ${files.join(', ')}`);
     }
     
+    // Priority 7: Recent search results (limited)
     if (state.lastSearchResults.length > 0) {
-        parts.push('\nRecent search results:');
-        state.lastSearchResults.slice(-3).forEach(s => {
-            parts.push(`- ${s.tool} "${s.query}" -> ${s.resultCount} results`);
-        });
+        const searches = state.lastSearchResults.slice(-2)
+            .map(s => `${s.tool}("${s.query}")→${s.resultCount}`);
+        parts.push(`SEARCHES: ${searches.join(', ')}`);
     }
     
-    if (state.pendingPatchId) {
-        parts.push(`\nPending patch: ${state.pendingPatchId} for ${state.pendingPatchFile}${state.pendingPatchConfirmed ? ' (confirmed)' : ' (awaiting approval)'}`);
-    }
-    
+    // Priority 8: Recent decisions
     if (state.lastDecision) {
-        parts.push(`\nRECENT DECISION: ${state.lastDecision}`);
+        parts.push(`LAST DECISION: ${state.lastDecision.substring(0, MAX_SUMMARY_CHARS)}`);
     }
     
+    // Priority 9: No progress warning
     if (state.noProgressCount > 0) {
-        parts.push(`\nNo progress steps: ${state.noProgressCount}`);
-    }
-    
-    if (state.actionHistory.length > 0) {
-        parts.push('\nRecent actions:');
-        state.actionHistory.slice(-5).forEach(a => {
-            parts.push(`- ${a.tool} ${a.summary}${a.success ? '' : ' (failed)'}`);
-        });
+        parts.push(`NO PROGRESS: ${state.noProgressCount} step(s)`);
     }
     
     return parts.join('\n');
@@ -332,10 +422,10 @@ export function addObservation(sessionKey, observation) {
 // Auto-transition mode based on state
 export function autoTransitionMode(sessionKey) {
     const state = sessionAgentState.get(sessionKey);
-    if (!state) return state?.mode || 'explore';
+    if (!state) return 'explore';
     
     // If patch is pending, we're awaiting approval
-    if (state.pendingPatchId && !state.pendingPatchConfirmed) {
+    if (state.patchState?.status === 'pending') {
         state.mode = 'propose';
         state.taskStatus = 'awaiting_approval';
         return state.mode;

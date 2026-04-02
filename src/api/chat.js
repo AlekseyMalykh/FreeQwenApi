@@ -817,12 +817,15 @@ export async function sendMessage(message, model = DEFAULT_MODEL, chatId = null,
     if (!tokenObj) return { error: 'Ошибка авторизации: не удалось получить токен', chatId };
 
     // Get or create agent state for this session
-    const sessionKey = chatId;
+    // sessionKey is separate from chatId (upstream Qwen conversation id)
+    const sessionKey = chatId ? `chat_${chatId}` : `session_${crypto.randomUUID().substring(0, 12)}`;
     const projectRoot = clientWorkdir || process.cwd();
     const agentState = getOrCreateAgentState({
         sessionKey,
         projectRoot,
-        cwd: clientWorkdir
+        cwd: clientWorkdir,
+        chatId,
+        parentId
     });
 
     // Inject tool descriptions into system message
