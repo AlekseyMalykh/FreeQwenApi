@@ -1,4 +1,11 @@
 import { parseToolCallFromText, executeTool, buildToolSystemPrompt, getToolDefinitions, confirmPendingPatch, rejectPendingPatch, getPendingPatch } from './src/tools/toolExecutor.js';
+import {
+    getAgentState, createAgentState, getOrCreateAgentState,
+    updateAgentState, recordToolAction, setPendingPatch,
+    clearPendingPatch, confirmSessionPatch, touchRecentFile,
+    setLastSearchResults, updateCwd, resetAgentState,
+    buildAgentRuntimeContext, getAllSessionKeys, getAgentStateCount
+} from './src/api/agentState.js';
 import path from 'path';
 import fs from 'fs';
 
@@ -247,6 +254,85 @@ if (r20.success) {
     const afterReject = getPendingPatch(r20.patch_id);
     assert(!afterReject, 'Rejected patch is removed');
 }
+
+// ─── 10. Agent state tests ───────────────────────────────────────────────────
+console.log('\n=== 10. Agent State Tests ===\n');
+
+// Test 1: state is created on first request
+const state1 = getOrCreateAgentState({
+    sessionKey: 'test_session_1',
+    projectRoot: 'C:/Projects/app',
+    cwd: 'C:/Projects/app'
+});
+assert(state1 && state1.projectRoot === 'C:/Projects/app', 'State created with projectRoot');
+assert(state1 && state1.cwd === 'C:/Projects/app', 'State created with cwd');
+
+// Test 2: state is restored for same session
+const state1Restored = getAgentState('test_session_1');
+assert(state1Restored && state1Restored.sessionKey === 'test_session_1', 'State restored for same session');
+
+// Test 3: state is isolated between sessions
+const state2 = getOrCreateAgentState({
+    sessionKey: 'test_session_2',
+    projectRoot: 'C:/Projects/other',
+    cwd: 'C:/Projects/other'
+});
+assert(state2 && state2.projectRoot === 'C:/Projects/other', 'Isolated state has different projectRoot');
+
+// Test 4: recentFiles tracking
+touchRecentFile('test_session_1', 'src/index.js');
+touchRecentFile('test_session_1', 'src/utils.js');
+const stateWithFiles = getAgentState('test_session_1');
+assert(stateWithFiles && stateWithFiles.recentFiles[0] === 'src/utils.js', 'Recent files tracked (most recent first)');
+assert(stateWithFiles && stateWithFiles.recentFiles.length === 2, 'Two recent files tracked');
+
+// Test 5: search results tracking
+setLastSearchResults('test_session_1', { tool: 'grep', query: 'function', resultCount: 5 });
+const stateWithSearch = getAgentState('test_session_1');
+assert(stateWithSearch && stateWithSearch.lastSearchResults.length === 1, 'Search results tracked');
+
+// Test 6: action history tracking
+recordToolAction('test_session_1', { tool: 'read_file', summary: 'src/index.js', success: true });
+const stateWithActions = getAgentState('test_session_1');
+assert(stateWithActions && stateWithActions.actionHistory.length === 1, 'Action history tracked');
+
+// Test 7: runtime context generation
+const runtimeContext = buildAgentRuntimeContext(stateWithActions);
+assert(runtimeContext.includes('C:/Projects/app'), 'Runtime context includes project root');
+assert(runtimeContext.includes('src/utils.js'), 'Runtime context includes recent files');
+assert(runtimeContext.includes('read_file'), 'Runtime context includes actions');
+
+// Test 8: pending patch in session state
+setPendingPatch('test_session_1', 'patch_abc123', 'src/index.js');
+const stateWithPatch = getAgentState('test_session_1');
+assert(stateWithPatch && stateWithPatch.pendingPatchId === 'patch_abc123', 'Pending patch tracked in state');
+
+// Test 9: clear pending patch
+clearPendingPatch('test_session_1');
+const stateAfterClear = getAgentState('test_session_1');
+assert(stateAfterClear && !stateAfterClear.pendingPatchId, 'Pending patch cleared from state');
+
+// Test 10: reset endpoint
+const preserved = resetAgentState('test_session_1');
+assert(preserved && preserved.projectRoot === 'C:/Projects/app', 'Reset preserves projectRoot');
+const afterReset = getAgentState('test_session_1');
+assert(!afterReset, 'State is null after reset');
+
+// Test 11: session isolation verification
+const sessionAState = getOrCreateAgentState({ sessionKey: 'session_a', projectRoot: 'C:/A' });
+const sessionBState = getOrCreateAgentState({ sessionKey: 'session_b', projectRoot: 'C:/B' });
+touchRecentFile('session_a', 'file_a.js');
+const sessionBAfter = getAgentState('session_b');
+assert(sessionBAfter && !sessionBAfter.recentFiles.includes('file_a.js'), 'Session A files not visible in Session B');
+
+// Test 12: state count
+const count = getAgentStateCount();
+assert(count >= 2, `State count is ${count} (at least 2 sessions)`);
+
+// Cleanup test sessions
+resetAgentState('test_session_2');
+resetAgentState('session_a');
+resetAgentState('session_b');
 
 // ─── Cleanup ─────────────────────────────────────────────────────────────────
 cleanup();

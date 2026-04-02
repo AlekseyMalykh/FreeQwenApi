@@ -3,6 +3,17 @@ import { checkAuthentication, checkVerification } from '../browser/auth.js';
 import { shutdownBrowser, initBrowser } from '../browser/browser.js';
 import { saveAuthToken } from '../browser/session.js';
 import { getAvailableToken, markRateLimited, removeInvalidToken } from './tokenManager.js';
+import {
+    getOrCreateAgentState,
+    recordToolAction,
+    setPendingPatch,
+    clearPendingPatch,
+    confirmSessionPatch,
+    touchRecentFile,
+    setLastSearchResults,
+    updateCwd,
+    buildAgentRuntimeContext
+} from './agentState.js';
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
@@ -804,11 +815,29 @@ export async function sendMessage(message, model = DEFAULT_MODEL, chatId = null,
     const tokenObj = await resolveAuthToken(browserContext);
     if (!tokenObj) return { error: 'Ошибка авторизации: не удалось получить токен', chatId };
 
+    // Get or create agent state for this session
+    const sessionKey = chatId;
+    const projectRoot = clientWorkdir || process.cwd();
+    const agentState = getOrCreateAgentState({
+        sessionKey,
+        projectRoot,
+        cwd: clientWorkdir
+    });
+
     // Inject tool descriptions into system message
     const hasTools = Array.isArray(tools) && tools.length > 0;
     let effectiveSystemMessage = systemMessage || '';
+    
+    // Build runtime context block
+    const runtimeContext = hasTools ? buildAgentRuntimeContext(agentState) : '';
+    if (runtimeContext) {
+        effectiveSystemMessage = effectiveSystemMessage
+            ? `${effectiveSystemMessage}\n\n${runtimeContext}`
+            : runtimeContext;
+        logDebug(`Runtime context injected (${runtimeContext.length} chars)`);
+    }
+    
     if (hasTools) {
-        const projectRoot = clientWorkdir || process.cwd();
         const toolPrompt = buildToolSystemPrompt(tools, projectRoot);
         effectiveSystemMessage = effectiveSystemMessage
             ? `${effectiveSystemMessage}\n\n${toolPrompt}`
@@ -960,6 +989,51 @@ export async function sendMessage(message, model = DEFAULT_MODEL, chatId = null,
 
                     logInfo(`Executing: ${toolName}(${JSON.stringify(toolArgs)})`);
                     const result = await executeTool(toolName, toolArgs, clientWorkdir);
+
+                    // Update agent state based on tool execution
+                    if (agentState) {
+                        // Update cwd if workdir was used
+                        if (toolArgs.workdir) updateCwd(sessionKey, toolArgs.workdir);
+                        
+                        // Track file operations
+                        if (['read_file', 'write_file', 'edit_file', 'apply_patch', 'propose_patch'].includes(toolName) && toolArgs.path) {
+                            touchRecentFile(sessionKey, toolArgs.path);
+                        }
+                        
+                        // Track search operations
+                        if (toolName === 'glob' && toolArgs.pattern) {
+                            setLastSearchResults(sessionKey, {
+                                tool: 'glob',
+                                query: toolArgs.pattern,
+                                resultCount: result.success ? (result.output?.match(/\n/g)?.length || 0) : 0
+                            });
+                        }
+                        if (toolName === 'grep' && toolArgs.pattern) {
+                            setLastSearchResults(sessionKey, {
+                                tool: 'grep',
+                                query: toolArgs.pattern,
+                                resultCount: result.success ? (result.output?.match(/\n/g)?.length || 0) : 0
+                            });
+                        }
+                        
+                        // Track patch operations
+                        if (toolName === 'propose_patch' && result.patch_id) {
+                            setPendingPatch(sessionKey, result.patch_id, toolArgs.path);
+                        }
+                        if (toolName === 'apply_patch' && result.success) {
+                            clearPendingPatch(sessionKey);
+                        }
+                        
+                        // Record action
+                        recordToolAction(sessionKey, {
+                            tool: toolName,
+                            summary: toolArgs.path || toolArgs.command || toolArgs.pattern || '',
+                            success: result.success
+                        });
+                        
+                        // Store last result summary
+                        agentState.lastToolResultSummary = (result.output || result.error || '').substring(0, 200);
+                    }
 
                     if (result.success) {
                         toolResults.push(`## Result of ${toolName}:\n${result.output || '(no output)'}`);

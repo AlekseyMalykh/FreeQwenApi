@@ -9,6 +9,7 @@ import { loadHistory, saveHistory } from './chatHistory.js';
 import { generateImage, getAvailableImageModels, checkImageApiAvailability } from './imageGeneration.js';
 import { MAX_FILE_SIZE, UPLOADS_DIR, DEFAULT_MODEL, STREAMING_CHUNK_DELAY, ALLOW_UNSCOPED_SESSION_CHAT_RESTORE } from '../config.js';
 import { confirmPendingPatch, rejectPendingPatch, getPendingPatch } from '../tools/toolExecutor.js';
+import { getAgentState, resetAgentState, getAllSessionKeys, getAgentStateCount } from './agentState.js';
 import multer from 'multer';
 import path from 'path';
 import fs from 'fs';
@@ -1554,6 +1555,59 @@ router.post('/tools/patches/:id/reject', async (req, res) => {
         res.json({ success: true, message: 'Patch rejected' });
     } catch (error) {
         logError('Error rejecting patch', error);
+        res.status(500).json({ error: 'Internal server error' });
+    }
+});
+
+/**
+ * GET /api/agent/state - Get agent state for current session
+ */
+router.get('/agent/state', async (req, res) => {
+    try {
+        const conversationId = req.query.conversation_id || req.headers['x-conversation-id'];
+        const sessionKey = conversationId || req.headers['x-session-key'];
+        
+        if (!sessionKey) {
+            return res.status(400).json({ error: 'Missing conversation_id or x-session-key header' });
+        }
+        
+        const state = getAgentState(sessionKey);
+        if (!state) return res.json({ message: 'No active session state', sessionKey });
+        
+        res.json({
+            sessionKey: state.sessionKey,
+            projectRoot: state.projectRoot,
+            cwd: state.cwd,
+            recentFiles: state.recentFiles,
+            lastSearchResults: state.lastSearchResults,
+            pendingPatchId: state.pendingPatchId,
+            pendingPatchFile: state.pendingPatchFile,
+            pendingPatchConfirmed: state.pendingPatchConfirmed,
+            actionHistory: state.actionHistory.slice(-10),
+            updatedAt: state.updatedAt
+        });
+    } catch (error) {
+        logError('Error getting agent state', error);
+        res.status(500).json({ error: 'Internal server error' });
+    }
+});
+
+/**
+ * POST /api/agent/state/reset - Reset agent state for current session
+ */
+router.post('/api/agent/state/reset', async (req, res) => {
+    try {
+        const conversationId = req.query.conversation_id || req.headers['x-conversation-id'];
+        const sessionKey = conversationId || req.headers['x-session-key'];
+        
+        if (!sessionKey) {
+            return res.status(400).json({ error: 'Missing conversation_id or x-session-key header' });
+        }
+        
+        const preserved = resetAgentState(sessionKey);
+        res.json({ success: true, message: 'Agent state reset', preserved });
+    } catch (error) {
+        logError('Error resetting agent state', error);
         res.status(500).json({ error: 'Internal server error' });
     }
 });
