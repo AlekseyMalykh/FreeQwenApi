@@ -24,6 +24,17 @@ import { AGENT_NO_PROGRESS_LIMIT } from '../config.js';
 
 const DEFAULT_MAX_STEPS = 5;
 
+function escapeRegExp(value) {
+    return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function joinPath(base, name) {
+    if (!base) return name;
+    const normalizedBase = base.replace(/[\\/]+$/, '');
+    const sep = normalizedBase.includes('\\') ? '\\' : '/';
+    return `${normalizedBase}${sep}${name}`;
+}
+
 /**
  * Extract explicit file path from user message.
  * Returns { type: 'file' | 'directory', path: string } or null.
@@ -48,12 +59,64 @@ export function extractExplicitPath(text) {
     }
     
     // Match simple filename with extension mentioned in context
-    const filename = text.match(/[\w-]+\.\w{1,4}/);
-    if (filename && text.includes('файл') || text.includes('file') || text.includes('открой') || text.includes('прочитай')) {
+    const filename = text.match(/[\w.-]+\.\w{1,8}/);
+    if (
+        filename &&
+        (
+            text.includes('файл') || text.includes('file') ||
+            text.includes('открой') || text.includes('прочитай') ||
+            text.includes('посмотри') || text.includes('show') || text.includes('read')
+        )
+    ) {
         return { type: 'file', path: filename[0] };
     }
     
     return null;
+}
+
+/**
+ * Try to infer a direct file target from the latest user message and agent state.
+ * Handles cases like:
+ * - "посмотри содержимое example"
+ * when recentFiles already contains "example.py" in the current cwd.
+ */
+export function inferDirectFileTarget(message, agentState) {
+    if (!message || !agentState) return null;
+
+    const cwd = agentState.cwd;
+    const recentFiles = Array.isArray(agentState.recentFiles) ? agentState.recentFiles : [];
+    if (!cwd || recentFiles.length === 0) return null;
+
+    // Explicit bare filename mention without extension, e.g. "example"
+    const bareNameMatch =
+        message.match(/\b(?:файл|file|содержимое|content of|read|open|посмотри|прочитай)\s+([A-Za-z0-9_.-]+)\b/i) ||
+        message.match(/\b([A-Za-z0-9_.-]+)\b/);
+
+    if (!bareNameMatch) return null;
+
+    const requestedName = bareNameMatch[1];
+    if (!requestedName) return null;
+
+    const candidates = recentFiles.filter(f => {
+        const fileName = f.split(/[\\/]/).pop();
+        if (!fileName) return false;
+
+        if (fileName.toLowerCase() === requestedName.toLowerCase()) return true;
+
+        const baseName = fileName.replace(/\.[^.]+$/, '');
+        return baseName.toLowerCase() === requestedName.toLowerCase();
+    });
+
+    if (candidates.length === 0) return null;
+
+    const chosen = candidates[0];
+    const fileName = chosen.split(/[\\/]/).pop();
+    if (!fileName) return null;
+
+    return {
+        type: 'file',
+        path: joinPath(cwd, fileName)
+    };
 }
 
 /**
@@ -72,11 +135,17 @@ function buildDirectPathGuidance(message, agentState) {
     const recentFileNames = agentState?.recentFiles?.map(f => f.split(/[\\/]/).pop()).filter(Boolean) || [];
     const lastDecision = agentState?.lastDecision || '';
     
-    // Try to find a filename mentioned in the message or recent context
-    const mentionedFile = message.match(/[\w-]+\.\w{1,4}/);
+    // Try to find a filename with extension mentioned in the message
+    const mentionedFile = message.match(/[\w.-]+\.\w{1,8}/);
     if (mentionedFile) {
-        const fullPath = pathInfo.path.replace(/[\\/]+$/, '') + '/' + mentionedFile[0];
+        const fullPath = joinPath(pathInfo.path, mentionedFile[0]);
         return `\nDIRECT INSTRUCTION: The user specified directory ${pathInfo.path} and mentioned file ${mentionedFile[0]}.\nUse read_file with path: ${fullPath}. Do NOT search or glob first.`;
+    }
+    
+    // Fallback: infer target from cwd + recently seen files, e.g. "example" -> "example.py"
+    const inferred = inferDirectFileTarget(message, agentState);
+    if (inferred?.type === 'file') {
+        return `\nDIRECT INSTRUCTION: The user referred to a file in the current working directory.\nUse read_file with path: ${inferred.path}. Do NOT search or glob first.`;
     }
     
     return `\nDIRECT INSTRUCTION: The user specified directory: ${pathInfo.path}\nUse bash with 'ls' or glob to list contents of this directory.`;

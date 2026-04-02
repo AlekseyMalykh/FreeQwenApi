@@ -12,7 +12,7 @@ import {
 } from './src/api/agentState.js';
 import { runAgentLoop } from './src/api/orchestrator.js';
 import { buildToolObservation, hasProgress } from './src/api/toolObservation.js';
-import { extractExplicitPath } from './src/api/orchestrator.js';
+import { extractExplicitPath, inferDirectFileTarget } from './src/api/orchestrator.js';
 import path from 'path';
 import fs from 'fs';
 
@@ -249,6 +249,29 @@ assert(p4 === null, 'Scenario 4: no path returns null');
 // Scenario 5: Unix-like path
 const p5 = extractExplicitPath('прочитай /home/user/project/main.py');
 assert(p5 && p5.type === 'file', 'Scenario 5: Unix path detected as file');
+
+// Scenario 6: inferDirectFileTarget - bare filename resolved from cwd + recentFiles
+const inferState = createAgentState({
+    sessionKey: 'infer_test',
+    projectRoot: 'C:/PythonProjects/Test/new',
+    cwd: 'C:/PythonProjects/Test/new'
+});
+inferState.recentFiles = [
+    'C:/PythonProjects/Test/new/example.py',
+    'C:/PythonProjects/Test/new/script.py'
+];
+
+const inferred = inferDirectFileTarget('посмотри файл example', inferState);
+assert(inferred && inferred.type === 'file', 'Scenario 6: inferDirectFileTarget returns file type');
+assert(inferred && inferred.path === 'C:/PythonProjects/Test/new/example.py', 'Scenario 6: correct path inferred from cwd + recentFiles');
+
+const inferred2 = inferDirectFileTarget('посмотри содержимое example', inferState);
+assert(inferred2 && inferred2.path === 'C:/PythonProjects/Test/new/example.py', 'Scenario 6b: works with different phrasing');
+
+const noInfer = inferDirectFileTarget('какие файлы есть в проекте?', inferState);
+assert(noInfer === null, 'Scenario 6c: no inference for general questions');
+
+resetAgentState('infer_test');
 
 // ─── 6. Orchestration loop tests ─────────────────────────────────────────────
 console.log('\n=== 6. Orchestration Loop Tests ===\n');
