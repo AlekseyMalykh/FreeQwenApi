@@ -64,12 +64,17 @@ export function createAgentState({ sessionKey, scope, projectRoot, cwd, taskGoal
         actionHistory: [],
         lastToolResultSummary: null,
         
-        // File context memory — agent remembers last read file and its content
+        // File context memory
         lastReadFile: null,
         lastReadContent: null,
-        // Active file target — current file the user is referring to for show/edit/follow-up actions
+
+        // Active targets for follow-up requests
         activeFileTarget: null,
         activeFileReason: null,
+        activeDirectoryTarget: null,
+        activeDirectoryReason: null,
+        lastListedDirectory: null,
+        lastListedEntries: [],
         
         // Phase 6: goal-aware runtime
         taskGoal: taskGoal || null,
@@ -252,6 +257,30 @@ export function updateCwd(sessionKey, newCwd) {
     state.updatedAt = Date.now();
 }
 
+export function setActiveDirectoryTarget(sessionKey, dirPath, reason = 'explicit_directory') {
+    const state = sessionAgentState.get(sessionKey);
+    if (!state || !dirPath) return;
+    state.activeDirectoryTarget = dirPath;
+    state.activeDirectoryReason = reason;
+    state.updatedAt = Date.now();
+}
+
+export function setActiveFileTarget(sessionKey, filePath, reason = 'explicit_file') {
+    const state = sessionAgentState.get(sessionKey);
+    if (!state || !filePath) return;
+    state.activeFileTarget = filePath;
+    state.activeFileReason = reason;
+    state.updatedAt = Date.now();
+}
+
+export function setLastListedDirectory(sessionKey, dirPath, entries = []) {
+    const state = sessionAgentState.get(sessionKey);
+    if (!state || !dirPath) return;
+    state.lastListedDirectory = dirPath;
+    state.lastListedEntries = Array.isArray(entries) ? entries.slice(0, 20) : [];
+    state.updatedAt = Date.now();
+}
+
 export function resetAgentState(sessionKey) {
     const state = sessionAgentState.get(sessionKey);
     if (!state) return null;
@@ -303,29 +332,36 @@ export function buildAgentRuntimeContext(state) {
     // Priority 2: Location
     parts.push(`PROJECT: ${state.projectRoot}`);
     parts.push(`CWD: ${state.cwd}`);
-    
+    if (state.activeDirectoryTarget) {
+        parts.push(`ACTIVE DIRECTORY: ${state.activeDirectoryTarget}`);
+    }
+
+
     // Priority 3: Pending patch state (critical for decision making)
     if (state.patchState?.status && state.patchState.status !== 'none') {
         const ps = state.patchState;
         const patchInfo = `PATCH: ${ps.status} (${ps.id?.substring(0, 12) || 'unknown'}) for ${ps.file || 'unknown'}`;
         parts.push(patchInfo);
     }
-    
-    // Priority 3b: Active file target / last read file (critical for follow-up questions)
+
+    // Priority 3b: Active file / last read file
     if (state.activeFileTarget) {
         parts.push(`ACTIVE FILE: ${state.activeFileTarget}`);
     }
-    
+
     if (state.lastReadFile) {
         parts.push(`LAST FILE READ: ${state.lastReadFile}`);
     }
-    
-    // Keep content very small and only as a hint that content is already available
+
     if (state.lastReadContent) {
         const excerpt = state.lastReadContent.substring(0, 160).replace(/\s+/g, ' ').trim();
         if (excerpt) parts.push(`LAST FILE CONTENT: ${excerpt}`);
     }
-    
+
+    if (state.lastListedDirectory) {
+        parts.push(`LAST LISTED DIRECTORY: ${state.lastListedDirectory}`);
+    }
+
     // Priority 4: Progress summary (concise)
     if (state.progressSummary.length > 0) {
         const recent = state.progressSummary.slice(-3);

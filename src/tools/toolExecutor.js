@@ -391,6 +391,12 @@ EDIT TARGET RULES:
 - Prefer propose_patch (or the edit tool) directly on the active file target.
 - For follow-up requests like "измени в этом файле", "change it in this file", or "replace x with 20", use the active file target.
 
+DIRECTORY CONTEXT RULES:
+- If the user asks about a directory, remember it as the active directory for follow-up requests.
+- If the user asks to open a file after listing a directory, resolve the file name against the active directory first.
+- Treat "cd ..." as a working-directory update in agent state, not as a persistent shell session.
+- Do NOT fall back to the project root when the user is clearly referring to another active directory.
+
 IMPORTANT:
 You do NOT have persistent access to tools.
 Tool results are returned directly to the user.

@@ -1,3 +1,4 @@
+import path from 'path';
 import { logInfo, logError, logDebug, logWarn } from '../logger/index.js';
 import {
     getOrCreateAgentState,
@@ -9,6 +10,9 @@ import {
     touchRecentFile,
     setLastSearchResults,
     updateCwd,
+    setActiveDirectoryTarget,
+    setActiveFileTarget,
+    setLastListedDirectory,
     buildAgentRuntimeContext,
     setTaskGoal,
     addProgressEntry,
@@ -29,6 +33,10 @@ function joinPath(base, name) {
     const normalizedBase = base.replace(/[\\/]+$/, '');
     const sep = normalizedBase.includes('\\') ? '\\' : '/';
     return `${normalizedBase}${sep}${name}`;
+}
+
+function normalizePath(p) {
+    return typeof p === 'string' ? p.replace(/\\/g, '/') : p;
 }
 
 /**
@@ -70,44 +78,6 @@ export function extractExplicitPath(text) {
     return null;
 }
 
-function inferActiveFileTarget(message, agentState) {
-    if (!message || !agentState) return null;
-
-    const text = message.toLowerCase();
-    const explicit = extractExplicitPath(message);
-    if (explicit?.type === 'file') {
-        return { path: explicit.path, reason: 'explicit_file_path' };
-    }
-
-    // If user mentions a directory and a filename with extension, use direct-path logic first elsewhere.
-    // Here we handle follow-up references and edit/show intents on the currently active/read file.
-    const followUpRefs = [
-        'этот файл', 'в этом файле', 'покажи этот файл', 'покажи файл',
-        'что в нем', 'что в нём', 'его содержимое', 'в нем', 'в нём',
-        'измени', 'замени', 'исправь', 'поменяй',
-        'this file', 'the file', 'show this file', 'what is in it',
-        'change', 'modify', 'replace', 'fix'
-    ];
-
-    const hasFollowUpRef = followUpRefs.some(ref => text.includes(ref));
-    if (hasFollowUpRef) {
-        if (agentState.activeFileTarget) {
-            return { path: agentState.activeFileTarget, reason: 'follow_up_active_file' };
-        }
-        if (agentState.lastReadFile) {
-            return { path: agentState.lastReadFile, reason: 'follow_up_last_read_file' };
-        }
-    }
-
-    // Bare filename inference via recent files/cwd
-    const inferred = inferDirectFileTarget(message, agentState);
-    if (inferred?.type === 'file') {
-        return { path: inferred.path, reason: 'inferred_from_recent_files' };
-    }
-
-    return null;
-}
-
 /**
  * Try to infer a direct file target from the latest user message and agent state.
  * Handles cases like:
@@ -120,6 +90,9 @@ export function inferDirectFileTarget(message, agentState) {
     const cwd = agentState.cwd;
     const recentFiles = Array.isArray(agentState.recentFiles) ? agentState.recentFiles : [];
     if (!cwd || recentFiles.length === 0) return null;
+
+    // If user asks to open a filename after listing a directory, prefer that directory
+    const listedDir = agentState.activeDirectoryTarget || agentState.lastListedDirectory || cwd;
 
     // Explicit bare filename mention without extension, e.g. "example"
     const bareNameMatch =
@@ -149,8 +122,64 @@ export function inferDirectFileTarget(message, agentState) {
 
     return {
         type: 'file',
-        path: joinPath(cwd, fileName)
+        path: joinPath(listedDir, fileName)
     };
+}
+
+function inferActiveDirectoryTarget(message, agentState) {
+    if (!message || !agentState) return null;
+    const explicit = extractExplicitPath(message);
+    if (explicit?.type === 'directory') return explicit.path;
+
+    const text = message.toLowerCase();
+    const dirRefs = [
+        'папк', 'директори', 'содержимое папки', 'в этой папке',
+        'folder', 'directory', 'contents of the folder', 'in this folder'
+    ];
+    const asksAboutDirectory = dirRefs.some(ref => text.includes(ref));
+    if (!asksAboutDirectory) return null;
+
+    return agentState.activeDirectoryTarget || agentState.lastListedDirectory || agentState.cwd || null;
+}
+
+function inferActiveFileTarget(message, agentState) {
+    if (!message || !agentState) return null;
+    const text = message.toLowerCase();
+
+    const explicit = extractExplicitPath(message);
+    if (explicit?.type === 'file') {
+        return { path: explicit.path, reason: 'explicit_file_path' };
+    }
+
+    const followUpRefs = [
+        'этот файл', 'в этом файле', 'покажи этот файл', 'покажи файл',
+        'что в нем', 'что в нём', 'его содержимое', 'в нем', 'в нём',
+        'измени', 'замени', 'исправь', 'поменяй', 'открой',
+        'this file', 'the file', 'show this file', 'what is in it',
+        'change', 'modify', 'replace', 'fix', 'open'
+    ];
+    const hasFollowUpRef = followUpRefs.some(ref => text.includes(ref));
+
+    if (hasFollowUpRef) {
+        if (agentState.activeFileTarget) return { path: agentState.activeFileTarget, reason: 'follow_up_active_file' };
+        if (agentState.lastReadFile) return { path: agentState.lastReadFile, reason: 'follow_up_last_read_file' };
+    }
+
+    const inferred = inferDirectFileTarget(message, agentState);
+    if (inferred?.type === 'file') return { path: inferred.path, reason: 'inferred_from_recent_files' };
+    return null;
+}
+
+function inferCdTarget(message, agentState) {
+    if (!message) return null;
+    const text = message.trim();
+    const match = text.match(/\bcd\s+([^\n\r)]+)/i);
+    if (!match) return null;
+    const rawTarget = match[1].trim().replace(/^["']|["']$/g, '');
+    if (!rawTarget) return null;
+    const base = agentState?.cwd || process.cwd();
+    const resolved = path.isAbsolute(rawTarget) ? rawTarget : path.resolve(base, rawTarget);
+    return resolved;
 }
 
 /**
@@ -160,6 +189,12 @@ export function inferDirectFileTarget(message, agentState) {
 function buildDirectPathGuidance(message, agentState) {
     const pathInfo = extractExplicitPath(message);
     const activeTarget = inferActiveFileTarget(message, agentState);
+    const activeDir = inferActiveDirectoryTarget(message, agentState);
+    const cdTarget = inferCdTarget(message, agentState);
+
+    if (cdTarget) {
+        return `\nDIRECT INSTRUCTION: The user wants to change working directory to ${normalizePath(cdTarget)}.\nDo NOT rely on shell session persistence. Use bash only if needed, and update the working context to this directory for subsequent actions.`;
+    }
 
     // Highest priority: active/explicit file target for show/edit follow-ups
     if (activeTarget?.path) {
@@ -169,51 +204,51 @@ function buildDirectPathGuidance(message, agentState) {
                 .some(w => lower.includes(w));
 
         if (isEditIntent) {
-            return `\nDIRECT INSTRUCTION: The target file is already known: ${activeTarget.path}\nDo NOT grep, glob, or read the file again. Use this file as the active edit target and propose a patch directly.`;
+            return `\nDIRECT INSTRUCTION: The target file is already known: ${normalizePath(activeTarget.path)}\nDo NOT grep, glob, or read the file again. Use this file as the active edit target and propose a patch directly.`;
         }
 
-        return `\nDIRECT INSTRUCTION: The target file is already known: ${activeTarget.path}\nDo NOT search, glob, or ask for clarification. Use read_file only if content is truly unavailable; otherwise answer using the existing file context.`;
+        return `\nDIRECT INSTRUCTION: The target file is already known: ${normalizePath(activeTarget.path)}\nDo NOT search, glob, or ask for clarification. Use read_file only if content is truly unavailable; otherwise answer using the existing file context.`;
     }
 
     if (!pathInfo) return '';
     
     if (pathInfo.type === 'file') {
-        return `\nDIRECT INSTRUCTION: The user specified an explicit file path: ${pathInfo.path}\nUse read_file with this exact path. Do NOT search, glob, or list directories first.`;
+        return `\nDIRECT INSTRUCTION: The user specified an explicit file path: ${normalizePath(pathInfo.path)}\nUse read_file with this exact path. Do NOT search, glob, or list directories first.`;
     }
     
     // Directory path - check if we have a recent file name to combine
-    const recentFileNames = agentState?.recentFiles?.map(f => f.split(/[\\/]/).pop()).filter(Boolean) || [];
-    const lastDecision = agentState?.lastDecision || '';
-    
-    // Try to find a filename with extension mentioned in the message
     const mentionedFile = message.match(/[\w.-]+\.\w{1,8}/);
     if (mentionedFile) {
         const fullPath = joinPath(pathInfo.path, mentionedFile[0]);
-        return `\nDIRECT INSTRUCTION: The user specified directory ${pathInfo.path} and mentioned file ${mentionedFile[0]}.\nUse read_file with path: ${fullPath}. Do NOT search or glob first.`;
+        return `\nDIRECT INSTRUCTION: The user specified directory ${pathInfo.path} and mentioned file ${mentionedFile[0]}.\nUse read_file with path: ${normalizePath(fullPath)}. Do NOT search or glob first.`;
     }
     
     // Fallback: infer target from cwd + recently seen files, e.g. "example" -> "example.py"
     const inferred = inferDirectFileTarget(message, agentState);
     if (inferred?.type === 'file') {
-        return `\nDIRECT INSTRUCTION: The user referred to a file in the current working directory.\nUse read_file with path: ${inferred.path}. Do NOT search or glob first.`;
+        return `\nDIRECT INSTRUCTION: The user referred to a file in the current working directory.\nUse read_file with path: ${normalizePath(inferred.path)}. Do NOT search or glob first.`;
     }
-    
+
+    if (activeDir) {
+        return `\nDIRECT INSTRUCTION: The active directory is ${normalizePath(activeDir)}.\nResolve relative file references against this directory. If the user asks for folder contents, inspect this directory directly.`;
+    }
+
     // Directory path — suggest appropriate tools based on capabilities
     const bashAvailable = ENABLE_BASH_TOOL;
     const projectRoot = agentState?.projectRoot || '';
-    const normalizedPath = pathInfo.path.replace(/\//g, '\\').toLowerCase();
-    const normalizedRoot = projectRoot.replace(/\//g, '\\').toLowerCase();
+    const normalizedPath = normalizePath(pathInfo.path).toLowerCase();
+    const normalizedRoot = normalizePath(projectRoot).toLowerCase();
     const insideProjectRoot = normalizedRoot && normalizedPath.startsWith(normalizedRoot);
 
     if (bashAvailable) {
-        return `\nDIRECT INSTRUCTION: The user specified directory: ${pathInfo.path}\nUse bash with 'ls' or glob to list contents of this directory.\n`;
+        return `\nDIRECT INSTRUCTION: The user specified directory: ${normalizePath(pathInfo.path)}\nUse bash with 'ls' or glob to list contents of this directory. If successful, treat this as the active directory for follow-up requests.`;
     }
 
     if (insideProjectRoot) {
-        return `\nDIRECT INSTRUCTION: The user specified directory: ${pathInfo.path}\nBash is disabled. Use glob to inspect this directory inside the project root.`;
+        return `\nDIRECT INSTRUCTION: The user specified directory: ${normalizePath(pathInfo.path)}\nBash is disabled. Use glob to inspect this directory inside the project root.`;
     }
 
-    return `\nDIRECT INSTRUCTION: The user specified directory: ${pathInfo.path}\nBash is disabled and this path is outside the project root. Do NOT call bash, glob, or read_file repeatedly. Explain the limitation clearly.`;
+    return `\nDIRECT INSTRUCTION: The user specified directory: ${normalizePath(pathInfo.path)}\nBash is disabled and this path is outside the project root. Do NOT call bash, glob, or read_file repeatedly. Explain the limitation clearly.`;
 }
 
 /**
@@ -255,7 +290,26 @@ function buildNextMessage(toolCalls, observations, state, step, userMessage) {
     
     // Direct path guidance (highest priority)
     const directPathGuidance = userMessage ? buildDirectPathGuidance(userMessage, state) : '';
-    
+
+    let directoryContextGuidance = '';
+    if (state?.activeDirectoryTarget && userMessage) {
+        const lower = userMessage.toLowerCase();
+        const asksToList = [
+            'содержимое папки', 'видишь содержимое', 'что в папке', 'покажи папку',
+            'folder contents', 'list directory', 'show folder', 'what is in the folder'
+        ].some(ref => lower.includes(ref));
+
+        const asksToOpenFile = [
+            'открой', 'покажи', 'прочитай', 'read', 'open', 'show'
+        ].some(ref => lower.includes(ref));
+
+        if (asksToList) {
+            directoryContextGuidance = `\nDIRECTORY CONTEXT: The active directory is ${state.activeDirectoryTarget}\nUse this directory directly. Do NOT fall back to the project root.`;
+        } else if (asksToOpenFile && !extractExplicitPath(userMessage)?.path) {
+            directoryContextGuidance = `\nDIRECTORY CONTEXT: Resolve relative file names against the active directory ${state.activeDirectoryTarget}\nIf the user asks to open hello.py, first try ${normalizePath(joinPath(state.activeDirectoryTarget, 'hello.py'))} when appropriate.`;
+        }
+    }
+
     // File context guidance — if user asks about "it" / "the file" / edit follow-up
     let fileContextGuidance = '';
     if (state?.lastReadFile && userMessage) {
@@ -285,7 +339,7 @@ function buildNextMessage(toolCalls, observations, state, step, userMessage) {
     if (!state?.lastReadFile && state?.activeFileTarget && userMessage) {
         fileContextGuidance = `\nFILE CONTEXT: The active file target is ${state.activeFileTarget}\nUse this file directly for the user's request.`;
     }
-    
+
     const guidance = `\nDecide the single best next step.
 You may:
 - explore more files (glob, grep)
@@ -295,9 +349,11 @@ You may:
 
 Do not repeat a previous action unless it is necessary.
 Prefer propose_patch instead of write_file for code changes.
-If the user gave an explicit file path, use read_file directly with that path.`;
-    
-    return `${directPathGuidance}${fileContextGuidance}${goalBlock}${modeBlock}${progressBlock}${obsBlock}${guidance}`;
+If the user gave an explicit file path, use read_file directly with that path.
+Do not use bash to read a file when read_file is available.
+Treat cd as a working-directory update, not as persistent shell state.`;
+
+    return `${directPathGuidance}${directoryContextGuidance}${fileContextGuidance}${goalBlock}${modeBlock}${progressBlock}${obsBlock}${guidance}`;
 }
 
 /**
@@ -389,7 +445,7 @@ export async function runAgentLoop(sendToModel, options = {}) {
             stopReason = stopCheck.reason;
             
             // Still execute the tool calls (e.g., propose_patch)
-            const { observations } = await executeToolCalls(toolCalls, agentState, sessionKey, clientWorkdir);
+            const { observations } = await executeToolCalls(toolCalls, agentState, sessionKey, clientWorkdir, lastUserMessage);
             allToolCalls.push(...toolCalls);
             allObservations.push(...observations);
             
@@ -398,7 +454,7 @@ export async function runAgentLoop(sendToModel, options = {}) {
         
         // Execute tool calls
         logInfo(`Executing ${toolCalls.length} tool call(s) at step ${step + 1}`);
-        const { observations, blockedTools } = await executeToolCalls(toolCalls, agentState, sessionKey, clientWorkdir);
+        const { observations, blockedTools } = await executeToolCalls(toolCalls, agentState, sessionKey, clientWorkdir, lastUserMessage);
         
         allToolCalls.push(...toolCalls);
         allObservations.push(...observations);
@@ -508,7 +564,7 @@ export async function runAgentLoop(sendToModel, options = {}) {
 /**
  * Execute a batch of tool calls and update agent state with structured observations
  */
-async function executeToolCalls(toolCalls, agentState, sessionKey, clientWorkdir) {
+async function executeToolCalls(toolCalls, agentState, sessionKey, clientWorkdir, lastUserMessage) {
     const observations = [];
     const blockedTools = [];
     
@@ -516,17 +572,14 @@ async function executeToolCalls(toolCalls, agentState, sessionKey, clientWorkdir
         const toolName = tc.name;
         const toolArgs = tc.arguments || {};
         
-        // Skip repeated read of active file — model already has the content
-        if (toolName === 'read_file' && toolArgs.path && agentState?.activeFileTarget === toolArgs.path) {
-            logWarn(`Skipping repeated read of active file: ${toolArgs.path}`);
-            observations.push({
-                tool: 'read_file',
-                path: toolArgs.path,
-                summary: `File ${toolArgs.path} was already read. Use the content you already have.`,
-                success: true
-            });
-            incrementNoProgress(sessionKey);
-            continue;
+        // Semantic cd handling: update cwd and active directory explicitly
+        if (toolName === 'bash' && typeof toolArgs.command === 'string') {
+            const cdTarget = inferCdTarget(toolArgs.command, agentState) || inferCdTarget(lastUserMessage, agentState);
+            if (cdTarget) {
+                const normalizedCd = normalizePath(cdTarget);
+                updateCwd(sessionKey, normalizedCd);
+                setActiveDirectoryTarget(sessionKey, normalizedCd, 'semantic_cd');
+            }
         }
         
         logInfo(`Executing: ${toolName}(${JSON.stringify(toolArgs)})`);
@@ -543,18 +596,19 @@ async function executeToolCalls(toolCalls, agentState, sessionKey, clientWorkdir
         
         // Update agent state
         if (agentState) {
-            if (toolArgs.workdir) updateCwd(sessionKey, toolArgs.workdir);
-            const toolPath = toolArgs.path || toolArgs.filePath || null;
+            if (toolArgs.workdir) updateCwd(sessionKey, normalizePath(toolArgs.workdir));
+            const toolPath = normalizePath(toolArgs.path || toolArgs.filePath || null);
 
             if (toolName === 'read_file' && toolPath) {
                 const wasSameFile = agentState.lastReadFile === toolPath;
 
-                // Store file context for follow-up questions
                 if (result.success) {
+                    // Store file context for follow-up questions
                     agentState.lastReadFile = toolPath;
                     agentState.lastReadContent = observation.content?.substring(0, 2000) || null;
-                    agentState.activeFileTarget = toolPath;
-                    agentState.activeFileReason = 'successful_read_file';
+                    setActiveFileTarget(sessionKey, toolPath, 'successful_read_file');
+                    const parentDir = normalizePath(path.dirname(toolPath));
+                    setActiveDirectoryTarget(sessionKey, parentDir, 'parent_of_active_file');
                 }
 
                 // Detect repeated read only if it was already the active/last-read file before this call
@@ -567,13 +621,19 @@ async function executeToolCalls(toolCalls, agentState, sessionKey, clientWorkdir
             if (['read_file', 'write_file', 'edit_file', 'apply_patch', 'propose_patch'].includes(toolName) && toolPath) {
                 touchRecentFile(sessionKey, toolPath);
             }
-            
+
             if (toolName === 'glob' && toolArgs.pattern) {
                 setLastSearchResults(sessionKey, {
                     tool: 'glob',
                     query: toolArgs.pattern,
                     resultCount: observation.fileCount || 0
                 });
+
+                const targetDir = normalizePath(toolArgs.path || toolArgs.workdir || agentState.cwd);
+                if (result.success && targetDir) {
+                    setLastListedDirectory(sessionKey, targetDir, observation.files || []);
+                    setActiveDirectoryTarget(sessionKey, targetDir, 'glob_listing');
+                }
             }
             if (toolName === 'grep' && toolArgs.pattern) {
                 setLastSearchResults(sessionKey, {
@@ -593,6 +653,14 @@ async function executeToolCalls(toolCalls, agentState, sessionKey, clientWorkdir
                     clearPendingPatch(sessionKey);
                 } else {
                     logWarn(`apply_patch blocked: patch not confirmed (status: ${state?.patchState?.status})`);
+                }
+            }
+
+            if (toolName === 'bash' && result.success) {
+                const listTarget = normalizePath(toolArgs.workdir || agentState.cwd);
+                if (listTarget && /(ls|dir|Get-ChildItem)/i.test(toolArgs.command || '')) {
+                    setLastListedDirectory(sessionKey, listTarget, []);
+                    setActiveDirectoryTarget(sessionKey, listTarget, 'bash_listing');
                 }
             }
             

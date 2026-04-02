@@ -291,6 +291,37 @@ const hasVagueRef = vagueRefs.some(ref => 'что в нем?'.toLowerCase().incl
 assert(hasVagueRef, 'Scenario 8: vague reference detected');
 resetAgentState('vague_test');
 
+// Scenario 9: active file and directory are visible in runtime context
+const activeState = createAgentState({ sessionKey: 'active_test', projectRoot: 'C:/test', cwd: 'C:/test' });
+activeState.activeFileTarget = 'C:/test/script.py';
+activeState.activeDirectoryTarget = 'C:/test';
+activeState.lastReadFile = 'C:/test/script.py';
+activeState.lastReadContent = 'x = 5\nprint(x)';
+const activeCtx = buildAgentRuntimeContext(activeState);
+assert(activeCtx.includes('ACTIVE FILE: C:/test/script.py'), 'Scenario 9: runtime context includes active file target');
+assert(activeCtx.includes('ACTIVE DIRECTORY: C:/test'), 'Scenario 9b: runtime context includes active directory target');
+resetAgentState('active_test');
+
+// Scenario 10: bare filename resolves against active directory / recent files
+const dirState = createAgentState({ sessionKey: 'dir_test', projectRoot: 'C:/PythonProjects/Test', cwd: 'C:/PythonProjects/Test' });
+dirState.activeDirectoryTarget = 'C:/PythonProjects/Test';
+dirState.recentFiles = [
+    'C:/PythonProjects/Test/hello.py',
+    'C:/PythonProjects/Test/new/script.py'
+];
+const inferredHello = inferDirectFileTarget('открой hello.py', dirState);
+assert(inferredHello && inferredHello.path === 'C:/PythonProjects/Test/hello.py', 'Scenario 10: resolves file from active directory');
+resetAgentState('dir_test');
+
+// Scenario 11: latest user turn should be used by the loop caller
+const routeLikeMessages = [
+    { role: 'user', content: 'открой script.py' },
+    { role: 'assistant', content: '...' },
+    { role: 'user', content: 'измени x на 20' }
+];
+const lastUser = routeLikeMessages.slice().reverse().find(m => m.role === 'user')?.content;
+assert(lastUser === 'измени x на 20', 'Scenario 11: latest user message extracted correctly');
+
 // ─── 6. Orchestration loop tests ─────────────────────────────────────────────
 console.log('\n=== 6. Orchestration Loop Tests ===\n');
 
