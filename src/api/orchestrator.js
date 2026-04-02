@@ -203,6 +203,16 @@ function buildNextMessage(toolCalls, observations, state, step, userMessage) {
         }
     }
     
+    // Edit-intent guidance — if user asks to modify the active file
+    let editIntentGuidance = '';
+    if (state?.activeFileTarget && userMessage) {
+        const editIntents = ['измени', 'изменить', 'поменяй', 'поменять', 'замени', 'заменить', 'исправь', 'исправить', 'добавь', 'удали', 'удалить', 'change', 'modify', 'replace', 'fix', 'add', 'remove', 'delete', 'update', 'set'];
+        const hasEditIntent = editIntents.some(word => userMessage.toLowerCase().includes(word));
+        if (hasEditIntent) {
+            editIntentGuidance = `\nEDIT TARGET: The user wants to modify code. The active file is: ${state.activeFileTarget}\nUse propose_patch or edit_file on this exact file. Do NOT grep, glob, or search the project. The target file is already known.`;
+        }
+    }
+    
     const guidance = `\nDecide the single best next step.
 You may:
 - explore more files (glob, grep)
@@ -214,7 +224,7 @@ Do not repeat a previous action unless it is necessary.
 Prefer propose_patch instead of write_file for code changes.
 If the user gave an explicit file path, use read_file directly with that path.`;
     
-    return `${directPathGuidance}${fileContextGuidance}${goalBlock}${modeBlock}${progressBlock}${obsBlock}${guidance}`;
+    return `${directPathGuidance}${fileContextGuidance}${editIntentGuidance}${goalBlock}${modeBlock}${progressBlock}${obsBlock}${guidance}`;
 }
 
 /**
@@ -433,6 +443,19 @@ async function executeToolCalls(toolCalls, agentState, sessionKey, clientWorkdir
         const toolName = tc.name;
         const toolArgs = tc.arguments || {};
         
+        // Skip repeated read of active file — model already has the content
+        if (toolName === 'read_file' && toolArgs.path && agentState?.activeFileTarget === toolArgs.path) {
+            logWarn(`Skipping repeated read of active file: ${toolArgs.path}`);
+            observations.push({
+                tool: 'read_file',
+                path: toolArgs.path,
+                summary: `File ${toolArgs.path} was already read. Use the content you already have.`,
+                success: true
+            });
+            incrementNoProgress(sessionKey);
+            continue;
+        }
+        
         logInfo(`Executing: ${toolName}(${JSON.stringify(toolArgs)})`);
         const result = await executeTool(toolName, toolArgs, clientWorkdir);
         
@@ -453,6 +476,8 @@ async function executeToolCalls(toolCalls, agentState, sessionKey, clientWorkdir
                 // Store file context for follow-up questions
                 agentState.lastReadFile = toolArgs.path;
                 agentState.lastReadContent = observation.content?.substring(0, 2000) || null;
+                // Set as active edit target — this is the file to operate on
+                agentState.activeFileTarget = toolArgs.path;
             }
             
             // Detect repeated read of same file

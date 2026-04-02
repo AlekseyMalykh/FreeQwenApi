@@ -68,6 +68,10 @@ export function createAgentState({ sessionKey, scope, projectRoot, cwd, taskGoal
         lastReadFile: null,
         lastReadContent: null,
         
+        // Active file target — the file the agent should operate on for edits
+        // Updated on read_file, used for vague edit intent resolution
+        activeFileTarget: null,
+        
         // Phase 6: goal-aware runtime
         taskGoal: taskGoal || null,
         taskStatus: 'exploring', // exploring | planning | awaiting_approval | done

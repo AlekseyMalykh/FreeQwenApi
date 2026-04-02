@@ -384,6 +384,12 @@ FILE CONTEXT MEMORY RULES:
 - Do NOT search or list directories if the file content is already available.
 - Answer using the previous read result directly.
 
+EDIT INTENT RULES:
+- If the user asks to modify, change, fix, replace, add, or remove code, and a file has been recently read — operate on that file directly.
+- Use propose_patch or edit_file on the ACTIVE FILE TARGET shown in the runtime context.
+- Do NOT grep, glob, or search the project when the target file is already known.
+- If the user says "измени x", "замени значение", "исправь это" — the target is the last read file.
+
 IMPORTANT:
 You do NOT have persistent access to tools.
 Tool results are returned directly to the user.
