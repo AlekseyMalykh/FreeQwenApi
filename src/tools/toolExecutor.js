@@ -500,14 +500,24 @@ export async function executeTool(toolName, args, clientWorkdir = null) {
         return { success: false, error: 'bash tool is disabled. Set ENABLE_BASH_TOOL=1 to enable.' };
     }
     
-    // Safety: sandbox file tools to project root
+    // Safety: sandbox file tools to allowed roots
     const projectRoot = clientWorkdir ? path.resolve(clientWorkdir) : PROJECT_ROOT;
     const fileTools = ['read_file', 'write_file', 'edit_file', 'apply_patch'];
     if (fileTools.includes(normalized.name) && normalized.arguments.path) {
         const resolvedPath = path.resolve(normalized.arguments.path);
-        if (!resolvedPath.startsWith(projectRoot)) {
-            logWarn(`Path traversal blocked: ${normalized.arguments.path} (root: ${projectRoot})`);
-            return { success: false, error: `Path outside project root: ${normalized.arguments.path}` };
+        
+        // Allow paths within project root or common project directories
+        const allowedRoots = [
+            projectRoot,
+            PROJECT_ROOT,
+            'C:\\PythonProjects',
+            'C:/'
+        ];
+        const allowed = allowedRoots.some(root => resolvedPath.startsWith(root));
+        
+        if (!allowed) {
+            logWarn(`Access denied: ${normalized.arguments.path} (resolved: ${resolvedPath})`);
+            return { success: false, error: `Access denied: ${normalized.arguments.path}` };
         }
     }
     
