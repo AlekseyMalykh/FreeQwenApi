@@ -796,10 +796,7 @@ router.post('/chat/completions', async (req, res) => {
         if (systemMessage) logInfo(`System message: ${systemMessage.substring(0, 50)}${systemMessage.length > 50 ? '...' : ''}`);
 
         const { combinedTools } = buildCombinedTools(tools, functions, tool_choice);
-
-        if (systemMessage) {
-            logInfo(`System message: ${systemMessage.substring(0, 50)}${systemMessage.length > 50 ? '...' : ''}`);
-        }
+        const sessionKey = resolveSessionKey(req.headers, req.body);
 
         // Логируем полную историю сообщений
         logInfo(`История содержит ${messages.length} сообщений: ${messages.map(m => m.role).join(', ')}`);

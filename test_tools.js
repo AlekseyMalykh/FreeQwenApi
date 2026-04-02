@@ -12,6 +12,7 @@ import {
 } from './src/api/agentState.js';
 import { runAgentLoop } from './src/api/orchestrator.js';
 import { buildToolObservation, hasProgress } from './src/api/toolObservation.js';
+import { extractExplicitPath } from './src/api/orchestrator.js';
 import path from 'path';
 import fs from 'fs';
 
@@ -224,6 +225,30 @@ assert(!hasProgress(progState, 'grep', { matchCount: 0, success: true }), 'grep 
 assert(hasProgress(progState, 'propose_patch', { patchId: 'p1', success: true }), 'propose_patch is progress');
 assert(hasProgress(progState, 'bash', { summary: 'git status output', success: true }), 'bash with output is progress');
 resetAgentState('prog_test');
+
+// ─── 5b. Direct path detection tests ─────────────────────────────────────────
+console.log('\n=== 5b. Direct Path Detection Tests ===\n');
+
+// Scenario 1: explicit full file path
+const p1 = extractExplicitPath('прочитай файл C:/PythonProjects/Test/new/example.py');
+assert(p1 && p1.type === 'file', 'Scenario 1: explicit full file path detected as file');
+assert(p1 && p1.path === 'C:/PythonProjects/Test/new/example.py', 'Scenario 1: correct path extracted');
+
+// Scenario 2: Windows path with backslashes
+const p2 = extractExplicitPath('посмотри C:\\PythonProjects\\Test\\new\\example.py');
+assert(p2 && p2.type === 'file', 'Scenario 2: Windows backslash path detected as file');
+
+// Scenario 3: directory path only
+const p3 = extractExplicitPath('что в директории C:/PythonProjects/Test/new');
+assert(p3 && p3.type === 'directory', 'Scenario 3: directory path detected');
+
+// Scenario 4: no path in message
+const p4 = extractExplicitPath('какие файлы есть в проекте?');
+assert(p4 === null, 'Scenario 4: no path returns null');
+
+// Scenario 5: Unix-like path
+const p5 = extractExplicitPath('прочитай /home/user/project/main.py');
+assert(p5 && p5.type === 'file', 'Scenario 5: Unix path detected as file');
 
 // ─── 6. Orchestration loop tests ─────────────────────────────────────────────
 console.log('\n=== 6. Orchestration Loop Tests ===\n');

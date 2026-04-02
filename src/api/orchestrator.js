@@ -25,6 +25,64 @@ import { AGENT_NO_PROGRESS_LIMIT } from '../config.js';
 const DEFAULT_MAX_STEPS = 5;
 
 /**
+ * Extract explicit file path from user message.
+ * Returns { type: 'file' | 'directory', path: string } or null.
+ */
+export function extractExplicitPath(text) {
+    if (!text) return null;
+    
+    // Match Windows paths: C:\... or C:/...
+    const winPath = text.match(/([A-Za-z]:[\\\/][^\s"'`,;]+(?:\.\w{1,4})?)/);
+    if (winPath) {
+        const p = winPath[1];
+        const hasExtension = /\.\w{1,4}$/.test(p);
+        return { type: hasExtension ? 'file' : 'directory', path: p };
+    }
+    
+    // Match Unix-like paths: /home/... or ./... or ../...
+    const unixPath = text.match(/(\/[^\s"'`,;]+(?:\.\w{1,4})?)/);
+    if (unixPath) {
+        const p = unixPath[1];
+        const hasExtension = /\.\w{1,4}$/.test(p);
+        return { type: hasExtension ? 'file' : 'directory', path: p };
+    }
+    
+    // Match simple filename with extension mentioned in context
+    const filename = text.match(/[\w-]+\.\w{1,4}/);
+    if (filename && text.includes('файл') || text.includes('file') || text.includes('открой') || text.includes('прочитай')) {
+        return { type: 'file', path: filename[0] };
+    }
+    
+    return null;
+}
+
+/**
+ * Build direct path guidance for the model.
+ * If user gave an explicit path, tell the model to use it directly.
+ */
+function buildDirectPathGuidance(message, agentState) {
+    const pathInfo = extractExplicitPath(message);
+    if (!pathInfo) return '';
+    
+    if (pathInfo.type === 'file') {
+        return `\nDIRECT INSTRUCTION: The user specified an explicit file path: ${pathInfo.path}\nUse read_file with this exact path. Do NOT search, glob, or list directories first.`;
+    }
+    
+    // Directory path - check if we have a recent file name to combine
+    const recentFileNames = agentState?.recentFiles?.map(f => f.split(/[\\/]/).pop()).filter(Boolean) || [];
+    const lastDecision = agentState?.lastDecision || '';
+    
+    // Try to find a filename mentioned in the message or recent context
+    const mentionedFile = message.match(/[\w-]+\.\w{1,4}/);
+    if (mentionedFile) {
+        const fullPath = pathInfo.path.replace(/[\\/]+$/, '') + '/' + mentionedFile[0];
+        return `\nDIRECT INSTRUCTION: The user specified directory ${pathInfo.path} and mentioned file ${mentionedFile[0]}.\nUse read_file with path: ${fullPath}. Do NOT search or glob first.`;
+    }
+    
+    return `\nDIRECT INSTRUCTION: The user specified directory: ${pathInfo.path}\nUse bash with 'ls' or glob to list contents of this directory.`;
+}
+
+/**
  * Check if the tool call should stop the loop
  */
 function checkStopConditions(toolCalls, step, maxSteps, state) {
@@ -49,7 +107,7 @@ function checkStopConditions(toolCalls, step, maxSteps, state) {
 /**
  * Build the next message for the model with goal-aware context
  */
-function buildNextMessage(toolCalls, observations, state, step) {
+function buildNextMessage(toolCalls, observations, state, step, userMessage) {
     const goalBlock = state?.taskGoal ? `\nYou are working on this task:\n${state.taskGoal}\n` : '';
     const modeBlock = `Current mode: ${state?.mode || 'explore'}`;
     
@@ -61,6 +119,9 @@ function buildNextMessage(toolCalls, observations, state, step) {
         ? `\nLatest observations:\n${observations.slice(-3).map(o => `- ${o.summary || o}`).join('\n')}`
         : '';
     
+    // Direct path guidance (highest priority)
+    const directPathGuidance = userMessage ? buildDirectPathGuidance(userMessage, state) : '';
+    
     const guidance = `\nDecide the single best next step.
 You may:
 - explore more files (glob, grep)
@@ -69,9 +130,10 @@ You may:
 - finish if the task is complete
 
 Do not repeat a previous action unless it is necessary.
-Prefer propose_patch instead of write_file for code changes.`;
+Prefer propose_patch instead of write_file for code changes.
+If the user gave an explicit file path, use read_file directly with that path.`;
     
-    return `${goalBlock}${modeBlock}${progressBlock}${obsBlock}${guidance}`;
+    return `${directPathGuidance}${goalBlock}${modeBlock}${progressBlock}${obsBlock}${guidance}`;
 }
 
 /**
@@ -220,8 +282,8 @@ export async function runAgentLoop(sendToModel, options = {}) {
             });
         }
         
-        // Build next message
-        currentMessage = buildNextMessage(toolCalls, observations, agentState, step);
+        // Build next message (pass original user message for direct path detection)
+        currentMessage = buildNextMessage(toolCalls, observations, agentState, step, options.initialMessage);
     }
     
     // If we exited the loop without stopping, it means max steps reached

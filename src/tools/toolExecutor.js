@@ -370,6 +370,14 @@ RULES:
 4. If no tool is needed, respond with normal text.
 5. ALWAYS use the project root as the base for all file paths and workdir.
 6. NEVER use paths outside the project root.${projectContext}
+
+CRITICAL PATH HANDLING RULES:
+- If the user provides an explicit file path (e.g., "C:/dir/file.py"), use read_file with that exact path.
+- Do NOT search, glob, grep, or list directories before trying the explicit path.
+- If the user names a file and then provides a directory, combine them into a direct target path.
+- Use exploration (glob, grep, ls) ONLY if the direct path fails or is truly ambiguous.
+- The user's explicit instruction always overrides exploratory heuristics.
+
 IMPORTANT:
 You do NOT have persistent access to tools.
 Tool results are returned directly to the user.
