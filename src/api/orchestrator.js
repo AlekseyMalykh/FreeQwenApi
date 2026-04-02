@@ -18,7 +18,7 @@ import {
     addObservation,
     autoTransitionMode
 } from './agentState.js';
-import { executeTool, parseToolCallFromText, TOOL_DEFINITIONS } from '../tools/toolExecutor.js';
+import { executeTool, parseToolCallFromText } from '../tools/toolExecutor.js';
 import { buildToolObservation, hasProgress } from './toolObservation.js';
 import { AGENT_NO_PROGRESS_LIMIT, ENABLE_BASH_TOOL } from '../config.js';
 
@@ -67,6 +67,44 @@ export function extractExplicitPath(text) {
         return { type: 'file', path: filename[0] };
     }
     
+    return null;
+}
+
+function inferActiveFileTarget(message, agentState) {
+    if (!message || !agentState) return null;
+
+    const text = message.toLowerCase();
+    const explicit = extractExplicitPath(message);
+    if (explicit?.type === 'file') {
+        return { path: explicit.path, reason: 'explicit_file_path' };
+    }
+
+    // If user mentions a directory and a filename with extension, use direct-path logic first elsewhere.
+    // Here we handle follow-up references and edit/show intents on the currently active/read file.
+    const followUpRefs = [
+        'этот файл', 'в этом файле', 'покажи этот файл', 'покажи файл',
+        'что в нем', 'что в нём', 'его содержимое', 'в нем', 'в нём',
+        'измени', 'замени', 'исправь', 'поменяй',
+        'this file', 'the file', 'show this file', 'what is in it',
+        'change', 'modify', 'replace', 'fix'
+    ];
+
+    const hasFollowUpRef = followUpRefs.some(ref => text.includes(ref));
+    if (hasFollowUpRef) {
+        if (agentState.activeFileTarget) {
+            return { path: agentState.activeFileTarget, reason: 'follow_up_active_file' };
+        }
+        if (agentState.lastReadFile) {
+            return { path: agentState.lastReadFile, reason: 'follow_up_last_read_file' };
+        }
+    }
+
+    // Bare filename inference via recent files/cwd
+    const inferred = inferDirectFileTarget(message, agentState);
+    if (inferred?.type === 'file') {
+        return { path: inferred.path, reason: 'inferred_from_recent_files' };
+    }
+
     return null;
 }
 
@@ -121,6 +159,22 @@ export function inferDirectFileTarget(message, agentState) {
  */
 function buildDirectPathGuidance(message, agentState) {
     const pathInfo = extractExplicitPath(message);
+    const activeTarget = inferActiveFileTarget(message, agentState);
+
+    // Highest priority: active/explicit file target for show/edit follow-ups
+    if (activeTarget?.path) {
+        const lower = message.toLowerCase();
+        const isEditIntent =
+            ['измени', 'замени', 'исправь', 'поменяй', 'change', 'modify', 'replace', 'fix']
+                .some(w => lower.includes(w));
+
+        if (isEditIntent) {
+            return `\nDIRECT INSTRUCTION: The target file is already known: ${activeTarget.path}\nDo NOT grep, glob, or read the file again. Use this file as the active edit target and propose a patch directly.`;
+        }
+
+        return `\nDIRECT INSTRUCTION: The target file is already known: ${activeTarget.path}\nDo NOT search, glob, or ask for clarification. Use read_file only if content is truly unavailable; otherwise answer using the existing file context.`;
+    }
+
     if (!pathInfo) return '';
     
     if (pathInfo.type === 'file') {
@@ -146,11 +200,20 @@ function buildDirectPathGuidance(message, agentState) {
     
     // Directory path — suggest appropriate tools based on capabilities
     const bashAvailable = ENABLE_BASH_TOOL;
+    const projectRoot = agentState?.projectRoot || '';
+    const normalizedPath = pathInfo.path.replace(/\//g, '\\').toLowerCase();
+    const normalizedRoot = projectRoot.replace(/\//g, '\\').toLowerCase();
+    const insideProjectRoot = normalizedRoot && normalizedPath.startsWith(normalizedRoot);
+
     if (bashAvailable) {
-        return `\nDIRECT INSTRUCTION: The user specified directory: ${pathInfo.path}\nUse bash with 'ls' or glob to list contents of this directory.`;
-    } else {
-        return `\nDIRECT INSTRUCTION: The user specified directory: ${pathInfo.path}\nNote: bash tool is disabled in this environment. Use glob to find files instead.`;
+        return `\nDIRECT INSTRUCTION: The user specified directory: ${pathInfo.path}\nUse bash with 'ls' or glob to list contents of this directory.\n`;
     }
+
+    if (insideProjectRoot) {
+        return `\nDIRECT INSTRUCTION: The user specified directory: ${pathInfo.path}\nBash is disabled. Use glob to inspect this directory inside the project root.`;
+    }
+
+    return `\nDIRECT INSTRUCTION: The user specified directory: ${pathInfo.path}\nBash is disabled and this path is outside the project root. Do NOT call bash, glob, or read_file repeatedly. Explain the limitation clearly.`;
 }
 
 /**
@@ -193,24 +256,34 @@ function buildNextMessage(toolCalls, observations, state, step, userMessage) {
     // Direct path guidance (highest priority)
     const directPathGuidance = userMessage ? buildDirectPathGuidance(userMessage, state) : '';
     
-    // File context guidance — if user asks about "it" or "the file"
+    // File context guidance — if user asks about "it" / "the file" / edit follow-up
     let fileContextGuidance = '';
     if (state?.lastReadFile && userMessage) {
-        const vagueRefs = ['в нем', 'в нём', 'его содержимое', 'что в нем', 'what is in it', 'show me the content', 'its content', 'the file'];
-        const hasVagueRef = vagueRefs.some(ref => userMessage.toLowerCase().includes(ref));
-        if (hasVagueRef) {
+        const lower = userMessage.toLowerCase();
+        const vagueRefs = [
+            'в нем', 'в нём', 'его содержимое', 'что в нем', 'что в нём',
+            'what is in it', 'show me the content', 'its content', 'the file',
+            'этот файл', 'в этом файле'
+        ];
+        const editRefs = [
+            'измени', 'замени', 'исправь', 'поменяй',
+            'change', 'modify', 'replace', 'fix'
+        ];
+        const hasVagueRef = vagueRefs.some(ref => lower.includes(ref));
+        const hasEditRef = editRefs.some(ref => lower.includes(ref));
+
+        if (hasVagueRef && !hasEditRef) {
             fileContextGuidance = `\nFILE CONTEXT: The user is asking about the last read file: ${state.lastReadFile}\nYou already have the content. Do NOT call read_file, ls, or glob. Answer using the content you already received.`;
         }
-    }
-    
-    // Edit-intent guidance — if user asks to modify the active file
-    let editIntentGuidance = '';
-    if (state?.activeFileTarget && userMessage) {
-        const editIntents = ['измени', 'изменить', 'поменяй', 'поменять', 'замени', 'заменить', 'исправь', 'исправить', 'добавь', 'удали', 'удалить', 'change', 'modify', 'replace', 'fix', 'add', 'remove', 'delete', 'update', 'set'];
-        const hasEditIntent = editIntents.some(word => userMessage.toLowerCase().includes(word));
-        if (hasEditIntent) {
-            editIntentGuidance = `\nEDIT TARGET: The user wants to modify code. The active file is: ${state.activeFileTarget}\nUse propose_patch or edit_file on this exact file. Do NOT grep, glob, or search the project. The target file is already known.`;
+
+        if (hasEditRef) {
+            const target = state.activeFileTarget || state.lastReadFile;
+            fileContextGuidance = `\nFILE CONTEXT: The user wants to modify the known file: ${target}\nDo NOT grep the whole project. Do NOT glob. Do NOT read the same file repeatedly. Use the known file as the edit target and propose a patch directly.`;
         }
+    }
+
+    if (!state?.lastReadFile && state?.activeFileTarget && userMessage) {
+        fileContextGuidance = `\nFILE CONTEXT: The active file target is ${state.activeFileTarget}\nUse this file directly for the user's request.`;
     }
     
     const guidance = `\nDecide the single best next step.
@@ -224,7 +297,7 @@ Do not repeat a previous action unless it is necessary.
 Prefer propose_patch instead of write_file for code changes.
 If the user gave an explicit file path, use read_file directly with that path.`;
     
-    return `${directPathGuidance}${fileContextGuidance}${editIntentGuidance}${goalBlock}${modeBlock}${progressBlock}${obsBlock}${guidance}`;
+    return `${directPathGuidance}${fileContextGuidance}${goalBlock}${modeBlock}${progressBlock}${obsBlock}${guidance}`;
 }
 
 /**
@@ -263,7 +336,7 @@ export async function runAgentLoop(sendToModel, options = {}) {
     logInfo(`Agent loop started for session: ${sessionKey}, maxSteps: ${maxSteps}, mode: ${agentState.mode}`);
     
     let currentMessage = options.initialMessage;
-    let lastUserMessage = options.initialMessage; // Track latest user message for path guidance
+    const lastUserMessage = options.lastUserMessage || options.initialMessage;
     let allToolCalls = [];
     let allObservations = [];
     let lastResponse = null;
@@ -471,19 +544,28 @@ async function executeToolCalls(toolCalls, agentState, sessionKey, clientWorkdir
         // Update agent state
         if (agentState) {
             if (toolArgs.workdir) updateCwd(sessionKey, toolArgs.workdir);
-            
-            if (toolName === 'read_file' && toolArgs.path && result.success) {
+            const toolPath = toolArgs.path || toolArgs.filePath || null;
+
+            if (toolName === 'read_file' && toolPath) {
+                const wasSameFile = agentState.lastReadFile === toolPath;
+
                 // Store file context for follow-up questions
-                agentState.lastReadFile = toolArgs.path;
-                agentState.lastReadContent = observation.content?.substring(0, 2000) || null;
-                // Set as active edit target — this is the file to operate on
-                agentState.activeFileTarget = toolArgs.path;
+                if (result.success) {
+                    agentState.lastReadFile = toolPath;
+                    agentState.lastReadContent = observation.content?.substring(0, 2000) || null;
+                    agentState.activeFileTarget = toolPath;
+                    agentState.activeFileReason = 'successful_read_file';
+                }
+
+                // Detect repeated read only if it was already the active/last-read file before this call
+                if (wasSameFile) {
+                    incrementNoProgress(sessionKey);
+                    logWarn(`Repeated read of same file: ${toolPath}`);
+                }
             }
-            
-            // Detect repeated read of same file
-            if (toolName === 'read_file' && toolArgs.path && agentState.lastReadFile === toolArgs.path) {
-                incrementNoProgress(sessionKey);
-                logWarn(`Repeated read of same file: ${toolArgs.path}`);
+
+            if (['read_file', 'write_file', 'edit_file', 'apply_patch', 'propose_patch'].includes(toolName) && toolPath) {
+                touchRecentFile(sessionKey, toolPath);
             }
             
             if (toolName === 'glob' && toolArgs.pattern) {

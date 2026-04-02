@@ -67,10 +67,9 @@ export function createAgentState({ sessionKey, scope, projectRoot, cwd, taskGoal
         // File context memory — agent remembers last read file and its content
         lastReadFile: null,
         lastReadContent: null,
-        
-        // Active file target — the file the agent should operate on for edits
-        // Updated on read_file, used for vague edit intent resolution
+        // Active file target — current file the user is referring to for show/edit/follow-up actions
         activeFileTarget: null,
+        activeFileReason: null,
         
         // Phase 6: goal-aware runtime
         taskGoal: taskGoal || null,
@@ -312,9 +311,19 @@ export function buildAgentRuntimeContext(state) {
         parts.push(patchInfo);
     }
     
-    // Priority 3b: Last read file (critical for follow-up questions)
+    // Priority 3b: Active file target / last read file (critical for follow-up questions)
+    if (state.activeFileTarget) {
+        parts.push(`ACTIVE FILE: ${state.activeFileTarget}`);
+    }
+    
     if (state.lastReadFile) {
         parts.push(`LAST FILE READ: ${state.lastReadFile}`);
+    }
+    
+    // Keep content very small and only as a hint that content is already available
+    if (state.lastReadContent) {
+        const excerpt = state.lastReadContent.substring(0, 160).replace(/\s+/g, ' ').trim();
+        if (excerpt) parts.push(`LAST FILE CONTENT: ${excerpt}`);
     }
     
     // Priority 4: Progress summary (concise)
